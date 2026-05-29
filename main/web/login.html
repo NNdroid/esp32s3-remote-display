@@ -1,0 +1,55 @@
+<!doctype html>
+<html>
+    <head>
+        <meta charset="utf-8" />
+        <title>设备登录</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <style>
+            body {
+                background: #121212;
+                color: #fff;
+                text-align: center;
+                font-family: system-ui;
+                margin-top: 10vh;
+            }
+            input {
+                padding: 12px;
+                margin: 10px;
+                border-radius: 6px;
+                border: 1px solid #333;
+                background: #1e1e1e;
+                color: #fff;
+                outline: none;
+            }
+            button {
+                padding: 12px 24px;
+                background: #00e5ff;
+                color: #000;
+                font-weight: bold;
+                border: none;
+                border-radius: 6px;
+                cursor: pointer;
+            }
+            .box {
+                background: #1e1e1e;
+                display: inline-block;
+                padding: 30px;
+                border-radius: 10px;
+                box-shadow: 0 4px 10px rgba(0, 0, 0, 0.5);
+            }
+        </style>
+    </head>
+    <body>
+        <div class="box">
+            <h2>🔒 无线屏幕控制台</h2>
+            <form action="/do_login" method="GET">
+                <input type="text" name="user" placeholder="请输入用户名" required /><br />
+                <input type="password" name="pwd" placeholder="请输入密码" required /><br /><br />
+                <button type="submit">登 入</button>
+            </form>
+        </div>
+        <script>
+            if (window.location.search.includes("err=1")) alert("账号或密码错误！");
+        </script>
+    </body>
+</html>

@@ -1,0 +1,249 @@
+<!doctype html>
+<html>
+    <head>
+        <meta charset="utf-8" />
+        <title>ESP32S3-ILI9341 无线屏幕仪表板</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <style>
+            body { font-family: system-ui, -apple-system, sans-serif; background-color: #121212; color: #ffffff; text-align: center; padding: 15px; margin: 0; }
+            h2 { color: #4caf50; font-size: 1.5rem; }
+            span#ssid { color: #00e5ff; }
+            .container { width: 95%; max-width: 800px; margin: 0 auto; background: #1e1e1e; padding: 20px; border-radius: 10px; box-shadow: 0 4px 10px rgba(0, 0, 0, 0.5); box-sizing: border-box; }
+            .panel-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 15px; margin-bottom: 20px; }
+            .control-panel { padding: 15px; background: #2a2a2a; border-radius: 8px; text-align: left; }
+            .control-panel h3 { margin-top: 0; color: #00e5ff; border-bottom: 1px solid #444; padding-bottom: 8px; font-size: 1.1rem; }
+            .row { margin-bottom: 12px; display: flex; align-items: center; }
+            .row label { width: 110px; display: inline-block; flex-shrink: 0; }
+            input[type="range"] { flex-grow: 1; cursor: pointer; accent-color: #00e5ff; }
+            input[type="text"], input[type="password"], input[type="number"], select { width: calc(100% - 120px); padding: 6px; background: #1e1e1e; border: 1px solid #444; color: #fff; border-radius: 4px; }
+            button.save { background: #00e5ff; color: #000; border: none; padding: 8px 16px; border-radius: 4px; cursor: pointer; font-weight: bold; width: 100%; margin-top: 5px; }
+            button.save-warn { background: #ff9800; color: #000; border: none; padding: 8px 16px; border-radius: 4px; cursor: pointer; font-weight: bold; width: 100%; margin-top: 5px; }
+            span#br_val { font-weight: bold; color: #00e5ff; width: 40px; text-align: right; }
+            .legend { display: flex; justify-content: center; gap: 20px; margin-bottom: 10px; font-size: 0.95rem; font-weight: bold; }
+            .leg-item { display: flex; align-items: center; gap: 8px; }
+            .box { width: 14px; height: 14px; border-radius: 3px; }
+            canvas { width: 100%; background: #121212; border-radius: 6px; border: 1px solid #333; }
+            .btn-logout { background: #ff3d00; color: #fff; border: none; padding: 6px 12px; border-radius: 4px; cursor: pointer; float: right; font-size: 1rem; }
+            .cmd-box { background: #121212; padding: 10px; border-radius: 4px; border: 1px solid #444; overflow-x: auto; margin-top: 10px; font-family: monospace; color: #a6e22e; line-height: 1.4; word-break: break-all; }
+            .progress-bar-bg { width: 100%; height: 20px; background-color: #e0e0e0; border-radius: 10px; overflow: hidden; }
+            .progress-bar-fill { height: 100%; width: 0%; background-color: #4caf50; transition: width 0.2s ease; }
+        </style>
+    </head>
+    <body>
+        <h2>📡 网络状态: <span id="ssid">读取中...</span> <button class="btn-logout" onclick="logout()">注销</button></h2>
+
+        <div class="container">
+            <div class="panel-grid">
+                <div class="control-panel">
+                    <h3>📺 硬件与显示设置</h3>
+                    <div class="row">
+                        <label>💡 屏幕亮度:</label>
+                        <input type="range" id="brightness" min="5" max="100" value="60" oninput="updateBrLabel(this.value)" onchange="setSetting(`brightness=${this.value}`)" />
+                        <span id="br_val">60%</span>
+                    </div>
+                    <div class="row">
+                        <label style="width: 100%"><input type="checkbox" id="osd_chk" onchange="setSetting(`osd=${this.checked?1:0}`)" /> 显示左下角 信号与帧率 (OSD)</label>
+                    </div>
+                    <div class="row">
+                        <label style="width: 100%"><input type="checkbox" id="time_osd_chk" onchange="setSetting(`time=${this.checked?1:0}`)" /> 显示右上角 实时系统时间</label>
+                    </div>
+                    <div class="row">
+                        <label>🌍 系统时区:</label>
+                        <select id="tz_select" onchange="setSetting(`timezone=${encodeURIComponent(this.value)}`)">
+                            <option value="UTC0">格林威治标准时间 (UTC+0)</option>
+                            <option value="CST-8">北京/台北时间 (UTC+8)</option>
+                            <option value="JST-9">日本标准时间 (UTC+9)</option>
+                            <option value="EST5EDT">美国东部时间 (EST/EDT)</option>
+                            <option value="PST8PDT">美国太平洋时间 (PST/PDT)</option>
+                        </select>
+                    </div>
+                </div>
+
+                <div class="control-panel">
+                    <h3>🌐 Wi-Fi 网络配置</h3>
+                    <p style="font-size: 0.9em; color: #aaa; margin-bottom: 20px">设备已使用官方蓝牙配网。<br />如需更换连接的网络，请点击下方按钮，设备将重启并进入蓝牙配网模式。</p>
+                    <button class="save-warn" onclick="resetWifi()">清除 Wi-Fi 并进入配网模式</button>
+                </div>
+
+                <div class="control-panel" style="grid-column: 1 / -1">
+                    <h3>🚀 影像流网络配置 (FFmpeg)</h3>
+                    <div class="row"><label>本机 IP:</label><span id="dev_ip" style="color: #00e5ff; font-weight: bold">获取中...</span></div>
+                    
+                    <div class="row">
+                        <label>接收端口:</label>
+                        <input type="number" id="udp_port" min="1" max="65535" />
+                    </div>
+                    <button class="save" onclick="saveNetworkConfig()" style="margin-bottom: 15px;">💾 保存网络设置并重启设备</button>
+
+                    <div class="cmd-box" id="ffmpeg_cmd">等待设备同步数据...</div>
+                    <button class="save" onclick="copyCmd()" style="width: auto; padding: 6px 15px">📋 复制推流命令</button>
+                </div>
+
+                <div class="control-panel" style="grid-column: 1 / -1">
+                    <h3>🔐 账户安全设置</h3>
+                    <div class="row"><label>新用户名:</label><input type="text" id="cfg_user" /></div>
+                    <div class="row"><label>新密码:</label><input type="password" id="cfg_pwd" /></div>
+                    <button class="save" onclick="updateAccount()">保存修改并重新登录</button>
+                </div>
+
+                <div class="control-panel" style="grid-column: 1 / -1">
+                    <h3>🚀 固件升级 (OTA)</h3>
+                    <input type="file" id="ota-file-input" accept=".bin" />
+                    <button class="save" onclick="startOTA()">开始升级</button>
+                    <div id="ota-progress-container" style="display: none; margin-top: 15px">
+                        <div class="progress-bar-bg"><div id="ota-progress-fill" class="progress-bar-fill"></div></div>
+                        <div id="ota-status-text" style="margin-top: 8px; font-size: 14px; color: #333">准备上传...</div>
+                    </div>
+                </div>
+
+                <div class="control-panel" style="grid-column: 1 / -1">
+                    <h3>🔄 设备重启</h3>
+                    <p style="font-size: 0.9em; color: #aaa; margin-bottom: 20px">如果设备出现异常或需要应用某些设置，您可以点击下方按钮重启设备。</p>
+                    <button class="save-warn" onclick="restartDevice()">立即重启设备</button>
+                </div>
+            </div>
+
+            <div class="legend">
+                <div class="leg-item"><div class="box" style="background: #00e5ff"></div>FPS: <span id="v_fps">-</span></div>
+                <div class="leg-item"><div class="box" style="background: #ff3d00"></div>RSSI: <span id="v_rssi">-</span> dBm</div>
+            </div>
+
+            <canvas id="chart" width="760" height="300"></canvas>
+        </div>
+
+        <script>
+            function logout() { document.cookie = "session=; Max-Age=0; path=/"; window.location.href = "/login"; }
+            function updateBrLabel(v) { document.getElementById("br_val").innerText = v + "%"; }
+            function setSetting(q) { fetch("/api/set?" + q).then((r) => { if (r.status === 401) logout(); }); }
+
+            function restartDevice() {
+                if (!confirm("确定要重启设备吗？请确保在重启过程中不要断电。")) return;
+                fetch("/api/restart", { method: "POST" }).then(res => res.json()).then(data => {
+                    if (data.success) {
+                        alert(data.message);
+                        setTimeout(() => window.location.reload(), 5000);
+                    } else {
+                        alert("重启请求失败！");
+                    }
+                }).catch(() => alert("网络异常，无法发送重启请求！"));
+            }
+
+            // 💾 储存网络配置并重启
+            function saveNetworkConfig() {
+                const port = document.getElementById("udp_port").value;
+                let url = `/api/set?udp_port=${port}`;
+                
+                fetch(url).then(res => res.text()).then(text => {
+                    if (text === "RESTART") {
+                        alert("流媒体网络设定已修改！设备正在重启以应用新的 Socket 规则，请稍候刷新页面。");
+                        setTimeout(() => window.location.reload(), 3000);
+                    } else {
+                        alert("设置已保存！");
+                    }
+                });
+            }
+
+            function startOTA() {
+                const fileInput = document.getElementById("ota-file-input");
+                if (fileInput.files.length === 0) { alert("⚠️ 请先选择一个 .bin 固件文件！"); return; }
+                const file = fileInput.files[0];
+                const progressContainer = document.getElementById("ota-progress-container");
+                const progressFill = document.getElementById("ota-progress-fill");
+                const statusText = document.getElementById("ota-status-text");
+
+                progressContainer.style.display = "block"; progressFill.style.width = "0%"; progressFill.style.backgroundColor = "#4CAF50"; statusText.innerText = "正在上传: 0%"; statusText.style.color = "#333";
+                const xhr = new XMLHttpRequest(); xhr.open("POST", "/api/ota", true);
+
+                xhr.upload.onprogress = function (e) {
+                    if (e.lengthComputable) {
+                        const pc = Math.round((e.loaded / e.total) * 100);
+                        progressFill.style.width = pc + "%"; statusText.innerText = `正在上传并写入: ${pc}%`;
+                        if (pc === 100) statusText.innerText = "上传完成，正在校验并重启设备，请勿断电...";
+                    }
+                };
+
+                xhr.onload = function () {
+                    if (xhr.status === 200) {
+                        progressFill.style.backgroundColor = "#2196F3"; statusText.innerText = "✅ 更新成功！设备重启中..."; statusText.style.color = "#2196F3";
+                        let cd = 10; const int = setInterval(() => { cd--; statusText.innerText = `✅ 更新成功！设备重启中 (${cd}s)...`; if (cd <= 0) { clearInterval(int); window.location.reload(); } }, 1000);
+                    } else {
+                        progressFill.style.backgroundColor = "#f44336"; statusText.innerText = `❌ 更新失败 (状态码: ${xhr.status})`; statusText.style.color = "#f44336";
+                    }
+                };
+                xhr.onerror = function () {
+                    if (progressFill.style.width === "100%") { statusText.innerText = "🔄 设备已断开..."; setTimeout(() => { window.location.reload(); }, 10000); } 
+                    else { progressFill.style.backgroundColor = "#f44336"; statusText.innerText = "❌ 网络异常！"; statusText.style.color = "#f44336"; }
+                };
+                xhr.send(file);
+            }
+
+            function updateAccount() {
+                let u = document.getElementById("cfg_user").value; let p = document.getElementById("cfg_pwd").value;
+                if (!u || !p) { alert("不能为空！"); return; }
+                fetch("/api/account?user=" + encodeURIComponent(u) + "&pwd=" + encodeURIComponent(p)).then((r) => {
+                    if (r.ok) { alert("账户修改成功！请重新登录。"); logout(); } else alert("修改失败");
+                });
+            }
+
+            function resetWifi() {
+                if (!confirm("确定要清除 Wi-Fi 设置并重新进入蓝牙配网吗？设备将重启。")) return;
+                fetch("/api/wifi_reset", { method: "POST" }).then((r) => { if (r.ok) alert("即将重启进入蓝牙配网模式！"); else alert("操作失败"); });
+            }
+
+            function copyCmd() {
+                const cmdText = document.getElementById("ffmpeg_cmd").innerText;
+                const textArea = document.createElement("textarea"); textArea.value = cmdText;
+                textArea.style.position = "fixed"; textArea.style.top = "-9999px"; textArea.style.left = "-9999px";
+                document.body.appendChild(textArea); textArea.focus(); textArea.select();
+                try { if (document.execCommand("copy")) alert("✅ 复制成功！可以直接去终端粘贴了。"); else alert("❌ 复制失败，请手动框选复制。"); } catch (err) { alert("❌ 浏览器不支持此复制方式。"); }
+                document.body.removeChild(textArea);
+            }
+
+            const cvs = document.getElementById("chart"); const ctx = cvs.getContext("2d"); const maxP = 30; let hist = []; let initSync = false;
+
+            function draw() {
+                ctx.clearRect(0, 0, cvs.width, cvs.height); const w = cvs.width, h = cvs.height, pad = 30; const drawW = w - pad * 2, drawH = h - pad * 2;
+                ctx.strokeStyle = "#333"; ctx.lineWidth = 1; ctx.beginPath();
+                for (let i = 0; i <= 5; i++) { let y = pad + (drawH / 5) * i; ctx.moveTo(pad, y); ctx.lineTo(w - pad, y); }
+                ctx.stroke();
+                if (hist.length === 0) return;
+                function drawLine(key, color, minV, maxV) {
+                    ctx.strokeStyle = color; ctx.lineWidth = 3; ctx.beginPath();
+                    hist.forEach((d, i) => {
+                        let x = pad + (i / (maxP - 1)) * drawW; let val = Math.max(minV, Math.min(maxV, d[key])); let y = pad + drawH - ((val - minV) / (maxV - minV)) * drawH;
+                        if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+                    });
+                    ctx.stroke();
+                }
+                drawLine("fps", "#00e5ff", 0, 60); drawLine("rssi", "#ff3d00", -100, 0);
+            }
+
+            setInterval(() => {
+                fetch("/api/data").then((r) => { if (r.status === 401) { logout(); return null; } return r.json(); }).then((d) => {
+                    if (!d) return;
+                    document.getElementById("ssid").innerText = d.ssid; document.getElementById("dev_ip").innerText = d.ip;
+                    document.getElementById("v_fps").innerText = d.fps; document.getElementById("v_rssi").innerText = d.rssi;
+
+                    // 🚀 动态更新 FFmpeg 命令 (固定使用单播设备 IP)
+                    let cmd = `ffmpeg -rtsp_transport tcp -fflags nobuffer+discardcorrupt+genpts -max_delay 0 -flags low_delay -use_wallclock_as_timestamps 1 -probesize 50000 -analyzeduration 100000 -i "rtsp://[你的输入源]" -vf "fps=25,scale=320:240" -an -c:v mjpeg -q:v 3 -pix_fmt yuvj420p -f mjpeg "udp://${d.ip}:${d.udp_port}?pkt_size=1200&buffer_size=65535"`;
+                    document.getElementById("ffmpeg_cmd").innerText = cmd;
+
+                    if (!initSync) {
+                        document.getElementById("brightness").value = d.brightness; updateBrLabel(d.brightness);
+                        document.getElementById("osd_chk").checked = d.osd === 1;
+                        document.getElementById("time_osd_chk").checked = d.time_osd === 1;
+                        if(d.timezone) document.getElementById("tz_select").value = d.timezone;
+                        document.getElementById("cfg_user").value = d.user;
+                        
+                        // 填入网络表单端口数值
+                        document.getElementById("udp_port").value = d.udp_port;
+
+                        initSync = true;
+                    }
+                    hist.push({ fps: d.fps, rssi: d.rssi }); if (hist.length > maxP) hist.shift(); draw();
+                }).catch((e) => console.log("连线中断"));
+            }, 1000);
+            draw();
+        </script>
+    </body>
+</html>

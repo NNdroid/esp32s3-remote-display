@@ -1,0 +1,17 @@
+# Name,   Type, SubType, Offset,  Size, Flags
+# 基础系统数据区
+nvs,      data, nvs,     ,        64K,
+otadata,  data, ota,     ,        8K,
+phy_init, data, phy,     ,        4K,
+
+# 自定义 NVS 存储区（用于保存账号、密码、亮度、配网随机码等）
+storage,  data, nvs,     ,        64K,
+
+# 固件区 (每个分配 3MB，当前固件才 1.2MB，极其充裕)
+factory,  app,  factory, ,        3M,
+ota_0,    app,  ota_0,   ,        3M,
+ota_1,    app,  ota_1,   ,        3M,
+
+# 剩余大概还有将近 7MB，预留一个独立数据区
+# 以后如果想把 HTML/图片/字库 放到外部文件系统里，就可以直接用这块地
+fatfs,    data, fat,     ,        6M,
