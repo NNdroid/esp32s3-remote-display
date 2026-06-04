@@ -744,175 +744,161 @@ void jpeg_decode_display_task(void *pvParameters)
     }
 }
 
-void udp_receiver_task(void *pvParameters)
-{
+void udp_receiver_task(void *pvParameters) {
     int rcv_buf_size = 65536;
-    struct timeval timeout = {.tv_sec = 1, .tv_usec = 0};
+    struct timeval timeout = { .tv_sec = 1, .tv_usec = 0 };
     TickType_t last_sync_time = xTaskGetTickCount();
     TickType_t last_scan_time = 0;
 
-    while (1)
-    {
+    uint8_t read_buf[2048]; // 用於接收 UDP 封包 (通常 FFmpeg 每個 UDP 包含 7 個 TS 包，即 1316 Bytes)
+
+    while (1) {
         xEventGroupWaitBits(s_wifi_event_group, WIFI_CONNECTED_BIT, pdFALSE, pdTRUE, portMAX_DELAY);
         int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
-        if (sock < 0)
-        {
-            vTaskDelay(pdMS_TO_TICKS(1000));
-            continue;
-        }
-
+        if (sock < 0) { vTaskDelay(pdMS_TO_TICKS(1000)); continue; }
+        
         setsockopt(sock, SOL_SOCKET, SO_RCVBUF, &rcv_buf_size, sizeof(rcv_buf_size));
         setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
 
-        struct sockaddr_in dest_addr = {.sin_addr.s_addr = htonl(INADDR_ANY), .sin_family = AF_INET, .sin_port = htons(g_udp_port)};
-        if (bind(sock, (struct sockaddr *)&dest_addr, sizeof(dest_addr)) < 0)
-        {
-            close(sock);
-            vTaskDelay(pdMS_TO_TICKS(1000));
-            continue;
-        }
+        struct sockaddr_in dest_addr = { .sin_addr.s_addr = htonl(INADDR_ANY), .sin_family = AF_INET, .sin_port = htons(g_udp_port) };
+        if (bind(sock, (struct sockaddr *)&dest_addr, sizeof(dest_addr)) < 0) { close(sock); vTaskDelay(pdMS_TO_TICKS(1000)); continue; }
 
         uint32_t current_frame_len = 0;
-        bool is_receiving_frame = false;
-        TickType_t last_packet_time = xTaskGetTickCount();
-
         rx_frame_t current_rx_frame;
         bool has_active_buffer = false;
+        
+        // TS 解析狀態變數
+        uint16_t video_pid = 0x1FFF; // 初始無效 PID
+        int8_t last_cc = -1;
+        bool frame_corrupted = true; // 預設丟棄，直到看見新幀的起點
 
-        while (1)
-        {
-            if ((xEventGroupGetBits(s_wifi_event_group) & WIFI_CONNECTED_BIT) == 0)
-                break;
+        while (1) {
+            if ((xEventGroupGetBits(s_wifi_event_group) & WIFI_CONNECTED_BIT) == 0) break;
 
+            // --- 維持你原本的系統狀態監控邏輯 ---
             TickType_t now_tick = xTaskGetTickCount();
-            if (now_tick - last_sync_time >= pdMS_TO_TICKS(1000))
-            {
+            if (now_tick - last_sync_time >= pdMS_TO_TICKS(1000)) {
                 g_async_free_heap_kb = esp_get_free_heap_size() / 1024;
-
                 wifi_ap_record_t ap_info;
-                if (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK)
-                {
+                if (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK) {
                     g_async_wifi_rssi = ap_info.rssi;
                     snprintf((char *)g_async_wifi_bssid, sizeof(g_async_wifi_bssid), "%02X:%02X:%02X:%02X:%02X:%02X",
-                             ap_info.bssid[0], ap_info.bssid[1], ap_info.bssid[2],
-                             ap_info.bssid[3], ap_info.bssid[4], ap_info.bssid[5]);
-
-                    if (ap_info.rssi < -60)
-                    {
-                        if (now_tick - last_scan_time >= pdMS_TO_TICKS(10000))
-                        {
-                            wifi_scan_config_t scan_config = {0};
-                            scan_config.ssid = ap_info.ssid;
-                            if (esp_wifi_scan_start(&scan_config, false) == ESP_OK)
-                            {
-                                last_scan_time = now_tick;
-                            }
-                        }
+                             ap_info.bssid[0], ap_info.bssid[1], ap_info.bssid[2], ap_info.bssid[3], ap_info.bssid[4], ap_info.bssid[5]);
+                    
+                    if (ap_info.rssi < -60 && now_tick - last_scan_time >= pdMS_TO_TICKS(10000)) {
+                        wifi_scan_config_t scan_config = {0}; scan_config.ssid = ap_info.ssid;
+                        if (esp_wifi_scan_start(&scan_config, false) == ESP_OK) last_scan_time = now_tick;
                     }
-                }
-                else
-                {
-                    g_async_wifi_rssi = 0;
-                    g_async_wifi_bssid[0] = '\0';
-                }
-                g_current_rx_speed_kbps = g_rx_bytes_1s / 1024;
-                g_rx_bytes_1s = 0;
-                last_sync_time = now_tick;
+                } else { g_async_wifi_rssi = 0; g_async_wifi_bssid[0] = '\0'; }
+                g_current_rx_speed_kbps = g_rx_bytes_1s / 1024; g_rx_bytes_1s = 0; last_sync_time = now_tick;
             }
 
-            if (is_receiving_frame && (xTaskGetTickCount() - last_packet_time > pdMS_TO_TICKS(2000)))
-            {
-                ESP_LOGW("UDP", "Frame timeout! Resetting state machine...");
-                is_receiving_frame = false;
-                current_frame_len = 0;
-            }
-
-            if (!has_active_buffer)
-            {
-                if (xQueueReceive(free_queue, &current_rx_frame, pdMS_TO_TICKS(5)) == pdTRUE)
-                {
-                    has_active_buffer = true;
-                    current_frame_len = 0;
-                }
-                else
-                {
-                    uint8_t dump[1472];
-                    while (recvfrom(sock, dump, sizeof(dump), MSG_DONTWAIT, NULL, NULL) > 0)
-                    {
-                    }
-                    vTaskDelay(pdMS_TO_TICKS(10));
-                    continue;
-                }
-            }
-
-            int len = recvfrom(sock, current_rx_frame.buf_ptr + current_frame_len, 1472, 0, NULL, NULL);
-
-            if (len > 0)
-            {
+            // 接收 UDP 數據
+            int len = recvfrom(sock, read_buf, sizeof(read_buf), 0, NULL, NULL);
+            
+            if (len > 0) {
                 g_rx_bytes_1s += len;
-                last_packet_time = xTaskGetTickCount();
-                uint8_t *data = current_rx_frame.buf_ptr + current_frame_len;
 
-                if (len >= 2 && data[0] == 0xFF && data[1] == 0xD8)
-                {
-                    if (current_frame_len > 0)
-                    {
-                        memmove(current_rx_frame.buf_ptr, data, len);
+                // 遍歷 UDP 封包內的每一個 188 Bytes TS 封包
+                for (int offset = 0; offset <= len - 188; offset += 188) {
+                    uint8_t *ts = &read_buf[offset];
+                    
+                    // TS 同步字節檢查
+                    if (ts[0] != 0x47) continue; 
+                    
+                    uint16_t pid = ((ts[1] & 0x1F) << 8) | ts[2];
+                    uint8_t pusi = (ts[1] & 0x40) >> 6;      // Payload Unit Start Indicator (新幀開始標誌)
+                    uint8_t afc = (ts[3] & 0x30) >> 4;       // Adaptation Field Control
+                    uint8_t cc = ts[3] & 0x0F;               // Continuity Counter (0-15 循環)
+                    
+                    if (afc == 0 || afc == 2) continue; // 沒有 Payload 的包直接跳過
+                    
+                    int payload_offset = 4;
+                    if (afc == 3) {
+                        payload_offset += 1 + ts[4]; // 跳過 Adaptation Field
                     }
-                    current_frame_len = 0;
-                    is_receiving_frame = true;
-                }
-
-                if (is_receiving_frame)
-                {
-                    current_frame_len += len;
-                    if (current_frame_len + 1500 > FRAME_BUF_SIZE)
-                    {
-                        is_receiving_frame = false;
-                        current_frame_len = 0;
-                        continue;
-                    }
-
-                    bool eof_found = false;
-                    if (current_frame_len > 2)
-                    {
-                        // 向前搜索最多 6 个字节，寻找 0xFF 0xD9
-                        for (int i = 1; i <= 6 && i < current_frame_len; i++)
-                        {
-                            if (current_rx_frame.buf_ptr[current_frame_len - i] == 0xD9 &&
-                                current_rx_frame.buf_ptr[current_frame_len - i - 1] == 0xFF)
-                            {
-                                eof_found = true;
-                                break;
+                    if (payload_offset >= 188) continue;
+                    
+                    uint8_t *payload = &ts[payload_offset];
+                    int payload_len = 188 - payload_offset;
+                    
+                    // 如果是新的一幀 (PES Packet Start)
+                    if (pusi) {
+                        // 尋找影片 PES Header (0x00 0x00 0x01 0xE0)
+                        if (payload_len >= 6 && payload[0] == 0x00 && payload[1] == 0x00 && payload[2] == 0x01 && payload[3] == 0xE0) {
+                            video_pid = pid; // 自動鎖定影片軌的 PID
+                            
+                            // 跳過 PES Header (通常是 9 Bytes + 附加長度)
+                            int pes_header_len = 9 + payload[8];
+                            if (payload_len > pes_header_len) {
+                                payload += pes_header_len;
+                                payload_len -= pes_header_len;
+                                
+                                // 準備新的緩衝區
+                                if (!has_active_buffer) {
+                                    if (xQueueReceive(free_queue, &current_rx_frame, 0) == pdTRUE) {
+                                        has_active_buffer = true;
+                                    }
+                                }
+                                
+                                // 如果成功拿到緩衝區，才開始接收新幀
+                                if (has_active_buffer) {
+                                    current_frame_len = 0;
+                                    frame_corrupted = false;
+                                    last_cc = cc;
+                                } else {
+                                    frame_corrupted = true;
+                                }
+                            } else {
+                                continue;
                             }
                         }
                     }
-
-                    if (eof_found)
-                    {
-                        current_rx_frame.len = current_frame_len;
-                        if (xQueueSend(jpeg_queue, &current_rx_frame, 0) == pdTRUE)
-                        {
-                            has_active_buffer = false;
+                    
+                    // 處理鎖定的視訊流資料
+                    if (pid == video_pid && has_active_buffer) {
+                        // 檢查丟包 (連續性計數器)
+                        if (!pusi) {
+                            int expected_cc = (last_cc + 1) & 0x0F;
+                            if (cc != expected_cc) {
+                                ESP_LOGW("TS", "Packet drop detected! Expected CC %d, got %d. Dropping frame.", expected_cc, cc);
+                                frame_corrupted = true; // 發生丟包，標記此幀為損壞，硬體安全了！
+                            }
+                            last_cc = cc;
                         }
-                        is_receiving_frame = false;
-                        current_frame_len = 0;
+                        
+                        // 如果這幀完美無缺，就將數據拷貝到 PSRAM
+                        if (!frame_corrupted) {
+                            if (current_frame_len + payload_len <= FRAME_BUF_SIZE) {
+                                memcpy(current_rx_frame.buf_ptr + current_frame_len, payload, payload_len);
+                                current_frame_len += payload_len;
+                                
+                                // 快速偵測 JPEG 結尾 (FF D9)，一旦出現立刻送入解碼器，降低延遲
+                                if (current_frame_len >= 2 &&
+                                    current_rx_frame.buf_ptr[current_frame_len-2] == 0xFF &&
+                                    current_rx_frame.buf_ptr[current_frame_len-1] == 0xD9) {
+                                    
+                                    current_rx_frame.len = current_frame_len;
+                                    if (xQueueSend(jpeg_queue, &current_rx_frame, 0) == pdTRUE) {
+                                        has_active_buffer = false;
+                                    }
+                                    // 幀已經送出，等待下一個 PUSI 到來
+                                    frame_corrupted = true; 
+                                }
+                            } else {
+                                ESP_LOGW("TS", "Frame overflow > %d Bytes!", FRAME_BUF_SIZE);
+                                frame_corrupted = true; // 超出緩衝區，放棄此幀
+                            }
+                        }
                     }
                 }
-            }
-            else if (errno != EAGAIN && errno != EWOULDBLOCK)
-            {
-                // 重置帧状态并继续监听
+            } else if (errno != EAGAIN && errno != EWOULDBLOCK) {
                 ESP_LOGE("UDP", "Socket error: %d", errno);
-                is_receiving_frame = false;
-                current_frame_len = 0;
-                vTaskDelay(pdMS_TO_TICKS(10)); // 防止疯狂刷错
-                continue;
+                vTaskDelay(pdMS_TO_TICKS(10));
             }
         }
-
-        if (has_active_buffer)
-        {
+        
+        if (has_active_buffer) {
             xQueueSend(free_queue, &current_rx_frame, 0);
             has_active_buffer = false;
         }
