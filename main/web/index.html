@@ -200,7 +200,7 @@
 
             <div class="control-panel" style="grid-column: 1 / -1">
                 <h3>🚀 Stream Network Config (FFmpeg)</h3>
-                <div class="row"><label>Device IP:</label><span id="dev_ip" style="color: var(--accent); font-weight: bold; font-family: monospace;">Fetching...</span></div>
+                <div class="row"><label>Device IP:</label><span id="dev_ip" style="color: var(--accent); font-weight: bold; font-family: monospace;">Fetching...</span><span id="dev_ip6" style="color: var(--accent); font-weight: bold; font-family: monospace;">Fetching...</span></div>
                 <div class="row"><label>UDP Port:</label><input type="number" id="udp_port" min="1" max="65535" placeholder="8888" /></div>
                 <button class="btn-primary" onclick="saveNetworkConfig()">💾 Save Network & Restart</button>
                 <div class="cmd-box" id="ffmpeg_cmd">Waiting for device sync...</div>
@@ -251,12 +251,121 @@
         function logout() { document.cookie = "session=; Max-Age=0; path=/"; window.location.href = "/login"; }
         function updateBrLabel(v) { document.getElementById("br_val").innerText = v + "%"; }
         function setSetting(q) { fetch("/api/set?" + q).then((r) => { if (r.status === 401) logout(); }); }
-        function restartDevice() { /* 保持原有的重启逻辑 */ fetch("/api/restart", { method: "POST" }).then(res => res.json()).then(data => { if (data.success) { alert("Restarting device..."); setTimeout(() => window.location.reload(), 5000); } else alert("Restart request failed!"); }).catch(() => alert("Network error!")); }
-        function saveNetworkConfig() { /* 保持原有逻辑 */ const port = document.getElementById("udp_port").value; fetch(`/api/set?udp_port=${port}`).then(res => res.text()).then(text => { if (text === "RESTART") { alert("Stream network settings modified! Device restarting..."); setTimeout(() => window.location.reload(), 3000); } else alert("Settings saved successfully!"); }); }
-        function updateAccount() { /* 保持原有逻辑 */ let u = document.getElementById("cfg_user").value; let p = document.getElementById("cfg_pwd").value; if (!u || !p) { alert("Username and Password cannot be empty!"); return; } fetch("/api/account?user=" + encodeURIComponent(u) + "&pwd=" + encodeURIComponent(p)).then((r) => { if (r.ok) { alert("Account updated! Please log in again."); logout(); } else alert("Update failed."); }); }
-        function resetWifi() { /* 保持原有逻辑 */ if (!confirm("Reset Wi-Fi settings and re-enter BLE provisioning?")) return; fetch("/api/wifi_reset", { method: "POST" }).then((r) => { if (r.ok) alert("Rebooting into BLE provisioning mode!"); else alert("Operation failed."); }); }
-        function copyCmd() { /* 保持原有逻辑 */ const cmdText = document.getElementById("ffmpeg_cmd").innerText; const textArea = document.createElement("textarea"); textArea.value = cmdText; textArea.style.position = "fixed"; textArea.style.top = "-9999px"; textArea.style.left = "-9999px"; document.body.appendChild(textArea); textArea.focus(); textArea.select(); try { if (document.execCommand("copy")) alert("✅ Copied!"); else alert("❌ Copy failed."); } catch (err) { alert("❌ Browser error."); } document.body.removeChild(textArea); }
-        function startOTA() { /* 保持原有逻辑 ...*/ }
+        
+        function restartDevice() {
+            if (!confirm("Are you sure you want to restart the device? Please ensure continuous power during reboot.")) return;
+            fetch("/api/restart", { method: "POST" }).then(res => res.json()).then(data => {
+                if (data.success) {
+                    alert("Restarting device...");
+                    setTimeout(() => window.location.reload(), 5000);
+                } else {
+                    alert("Restart request failed!");
+                }
+            }).catch(() => alert("Network error, cannot send restart request!"));
+        }
+
+        function saveNetworkConfig() {
+            const port = document.getElementById("udp_port").value;
+            let url = `/api/set?udp_port=${port}`;
+            
+            fetch(url).then(res => res.text()).then(text => {
+                if (text === "RESTART") {
+                    alert("Stream network settings modified! Device is restarting to apply socket rules. Please refresh shortly.");
+                    setTimeout(() => window.location.reload(), 3000);
+                } else {
+                    alert("Settings saved successfully!");
+                }
+            });
+        }
+
+        function startOTA() {
+            const fileInput = document.getElementById("ota-file-input");
+            if (fileInput.files.length === 0) { alert("⚠️ Please select a .bin firmware file first!"); return; }
+            const file = fileInput.files[0];
+            const progressContainer = document.getElementById("ota-progress-container");
+            const progressFill = document.getElementById("ota-progress-fill");
+            const statusText = document.getElementById("ota-status-text");
+
+            progressContainer.style.display = "block"; 
+            progressFill.style.width = "0%"; 
+            progressFill.style.backgroundColor = "var(--accent)"; 
+            statusText.innerText = "Uploading: 0%"; 
+            statusText.style.color = "var(--text-muted)";
+            
+            const xhr = new XMLHttpRequest(); xhr.open("POST", "/api/ota", true);
+
+            xhr.upload.onprogress = function (e) {
+                if (e.lengthComputable) {
+                    const pc = Math.round((e.loaded / e.total) * 100);
+                    progressFill.style.width = pc + "%"; 
+                    statusText.innerText = `Uploading & Flashing: ${pc}%`;
+                    if (pc === 100) statusText.innerText = "Upload complete. Verifying and rebooting, do NOT power off...";
+                }
+            };
+
+            xhr.onload = function () {
+                if (xhr.status === 200) {
+                    progressFill.style.backgroundColor = "var(--success)"; 
+                    statusText.innerText = "✅ Update successful! Rebooting..."; 
+                    statusText.style.color = "var(--success)";
+                    let cd = 10; 
+                    const int = setInterval(() => { 
+                        cd--; 
+                        statusText.innerText = `✅ Update successful! Rebooting (${cd}s)...`; 
+                        if (cd <= 0) { clearInterval(int); window.location.reload(); } 
+                    }, 1000);
+                } else {
+                    progressFill.style.backgroundColor = "var(--danger)"; 
+                    statusText.innerText = `❌ Update failed (Status: ${xhr.status})`; 
+                    statusText.style.color = "var(--danger)";
+                }
+            };
+            
+            xhr.onerror = function () {
+                if (progressFill.style.width === "100%") { 
+                    statusText.innerText = "🔄 Device disconnected (Rebooting)..."; 
+                    setTimeout(() => { window.location.reload(); }, 10000); 
+                } else { 
+                    progressFill.style.backgroundColor = "var(--danger)"; 
+                    statusText.innerText = "❌ Network error!"; 
+                    statusText.style.color = "var(--danger)"; 
+                }
+            };
+            xhr.send(file);
+        }
+
+        function updateAccount() {
+            let u = document.getElementById("cfg_user").value; 
+            let p = document.getElementById("cfg_pwd").value;
+            if (!u || !p) { alert("Username and Password cannot be empty!"); return; }
+            fetch("/api/account?user=" + encodeURIComponent(u) + "&pwd=" + encodeURIComponent(p)).then((r) => {
+                if (r.ok) { alert("Account updated successfully! Please log in again."); logout(); } 
+                else alert("Update failed.");
+            });
+        }
+
+        function resetWifi() {
+            if (!confirm("Are you sure you want to reset Wi-Fi settings and re-enter BLE provisioning? The device will restart.")) return;
+            fetch("/api/wifi_reset", { method: "POST" }).then((r) => { 
+                if (r.ok) alert("Rebooting into BLE provisioning mode!"); 
+                else alert("Operation failed."); 
+            });
+        }
+
+        function copyCmd() {
+            const cmdText = document.getElementById("ffmpeg_cmd").innerText;
+            const textArea = document.createElement("textarea"); 
+            textArea.value = cmdText;
+            textArea.style.position = "fixed"; textArea.style.top = "-9999px"; textArea.style.left = "-9999px";
+            document.body.appendChild(textArea); textArea.focus(); textArea.select();
+            try { 
+                if (document.execCommand("copy")) alert("✅ Copied to clipboard!"); 
+                else alert("❌ Copy failed. Please select and copy manually."); 
+            } catch (err) { 
+                alert("❌ Your browser does not support clipboard API."); 
+            }
+            document.body.removeChild(textArea);
+        }
 
         // ================= Chart 逻辑升级 =================
         const cvs = document.getElementById("chart"); 
@@ -420,6 +529,7 @@
                 if (!d) return;
                 document.getElementById("ssid").innerText = d.ssid; 
                 document.getElementById("dev_ip").innerText = d.ip;
+                document.getElementById("dev_ip6").innerText = d.ip6 ? ` / ${d.ip6}` : "";
                 document.getElementById("v_fps").innerText = d.fps; 
                 document.getElementById("v_rssi").innerText = d.rssi;
 

@@ -70,6 +70,7 @@ volatile bool g_show_time_osd = true;
 char g_admin_user[32] = "admin";
 char g_admin_pwd[64] = "123456";
 char g_device_ip[20] = "0.0.0.0";
+char g_device_ip6[40] = "0000:0000:0000:0000:0000:0000:0000:0000";
 char g_timezone[32] = "CST-8";
 
 volatile int32_t g_udp_port = 8888;
@@ -385,6 +386,15 @@ static void sys_event_handler(void *arg, esp_event_base_t event_base, int32_t ev
             }
         }
     }
+    else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_CONNECTED)
+    {
+        ESP_LOGI("WIFI", "Connected to AP, triggering IPv6...");
+        // 拿到默认 STA 句柄并启动 IPv6 本地链路生成
+        esp_netif_t *netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+        if (netif) {
+            esp_netif_create_ip6_linklocal(netif);
+        }
+    }
     else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP)
     {
         wifi_config_t wifi_cfg;
@@ -401,6 +411,12 @@ static void sys_event_handler(void *arg, esp_event_base_t event_base, int32_t ev
         sprintf(g_device_ip, IPSTR, IP2STR(&event->ip_info.ip));
         s_retry_num = 0;
         xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
+    }
+    else if (event_base == IP_EVENT && event_id == IP_EVENT_GOT_IP6)
+    {
+        ip_event_got_ip6_t *event = (ip_event_got_ip6_t *)event_data;
+        sprintf(g_device_ip6, IPV6STR, IPV62STR(event->ip6_info.ip));
+        ESP_LOGI("WIFI", "Got IPv6 Address: %s", g_device_ip6);
     }
 }
 
@@ -754,14 +770,28 @@ void udp_receiver_task(void *pvParameters) {
 
     while (1) {
         xEventGroupWaitBits(s_wifi_event_group, WIFI_CONNECTED_BIT, pdFALSE, pdTRUE, portMAX_DELAY);
-        int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
+        // 改為 AF_INET6
+        int sock = socket(AF_INET6, SOCK_DGRAM, IPPROTO_IP);
         if (sock < 0) { vTaskDelay(pdMS_TO_TICKS(1000)); continue; }
         
+        // 關閉 IPV6_V6ONLY，開啟 Dual Stack (雙棧) 模式，使其能同時接收 IPv4 與 IPv6 推流
+        int v6only = 0;
+        setsockopt(sock, IPPROTO_IPV6, IPV6_V6ONLY, &v6only, sizeof(v6only));
+
         setsockopt(sock, SOL_SOCKET, SO_RCVBUF, &rcv_buf_size, sizeof(rcv_buf_size));
         setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
 
-        struct sockaddr_in dest_addr = { .sin_addr.s_addr = htonl(INADDR_ANY), .sin_family = AF_INET, .sin_port = htons(g_udp_port) };
-        if (bind(sock, (struct sockaddr *)&dest_addr, sizeof(dest_addr)) < 0) { close(sock); vTaskDelay(pdMS_TO_TICKS(1000)); continue; }
+        // 使用 sockaddr_in6 結構體
+        struct sockaddr_in6 dest_addr = { 0 };
+        dest_addr.sin6_family = AF_INET6;
+        dest_addr.sin6_port = htons(g_udp_port);
+        dest_addr.sin6_addr = in6addr_any; // in6addr_any 同時包含 0.0.0.0 與 ::
+
+        if (bind(sock, (struct sockaddr *)&dest_addr, sizeof(dest_addr)) < 0) { 
+            close(sock); 
+            vTaskDelay(pdMS_TO_TICKS(1000)); 
+            continue; 
+        }
 
         uint32_t current_frame_len = 0;
         rx_frame_t current_rx_frame;
@@ -1049,10 +1079,10 @@ static esp_err_t api_data_handler(httpd_req_t *req)
         if (wifi_cfg.sta.ssid[0] != '\0')
             strncpy(current_ssid, (char *)wifi_cfg.sta.ssid, sizeof(current_ssid) - 1);
     }
-    char json_resp[500];
+    char json_resp[600];
     snprintf(json_resp, sizeof(json_resp),
-             "{\"ssid\":\"%s\",\"rssi\":%d,\"fps\":%d,\"brightness\":%ld,\"osd\":%d,\"time_osd\":%d,\"user\":\"%s\",\"ip\":\"%s\",\"timezone\":\"%s\",\"udp_port\":%ld}",
-             current_ssid, g_current_rssi, g_current_fps, g_current_brightness, g_show_osd, g_show_time_osd, g_admin_user, g_device_ip, g_timezone, g_udp_port);
+             "{\"ssid\":\"%s\",\"rssi\":%d,\"fps\":%d,\"brightness\":%ld,\"osd\":%d,\"time_osd\":%d,\"user\":\"%s\",\"ip\":\"%s\",\"ip6\":\"%s\",\"timezone\":\"%s\",\"udp_port\":%ld}",
+             current_ssid, g_current_rssi, g_current_fps, g_current_brightness, g_show_osd, g_show_time_osd, g_admin_user, g_device_ip, g_device_ip6, g_timezone, g_udp_port);
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, json_resp, HTTPD_RESP_USE_STRLEN);
     return ESP_OK;
@@ -1289,7 +1319,7 @@ void app_main(void)
 
     ESP_ERROR_CHECK(esp_event_handler_register(NETWORK_PROV_EVENT, ESP_EVENT_ANY_ID, &sys_event_handler, NULL));
     ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &sys_event_handler, NULL));
-    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &sys_event_handler, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, ESP_EVENT_ANY_ID, &sys_event_handler, NULL));
 
     lcd_hardware_init();
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
@@ -1313,6 +1343,7 @@ void app_main(void)
     {
         network_prov_mgr_deinit();
         ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+        ESP_ERROR_CHECK(esp_wifi_set_protocol(WIFI_IF_STA, WIFI_PROTOCOL_11N));
         ESP_ERROR_CHECK(esp_wifi_start());
     }
 
@@ -1320,6 +1351,6 @@ void app_main(void)
     ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
     init_time_sync();
 
-    xTaskCreatePinnedToCore(udp_receiver_task, "udp_task", 4096, NULL, 8, NULL, 0);
+    xTaskCreatePinnedToCore(udp_receiver_task, "udp_task", 8192, NULL, 8, NULL, 0);
     start_webserver();
 }
