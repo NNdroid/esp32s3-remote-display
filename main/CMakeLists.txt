@@ -11,6 +11,10 @@ idf_component_register(SRCS "main.c"
                         esp_https_ota 
                         network_provisioning   
                         bt
+                        fatfs
+                        esp_driver_i2s
+                        esp_driver_i2c
+                        esp_adc
                     PRIV_REQUIRES 
                         esp_driver_ledc 
                         esp_lcd

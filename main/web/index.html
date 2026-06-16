@@ -99,6 +99,10 @@
             flex-grow: 1; min-width: 150px; padding: 10px 12px; background: var(--input-bg); 
             border: 1px solid var(--input-border); color: var(--text-main); border-radius: 10px; outline: none; transition: all 0.3s ease;
         }
+        input[type="color"] {
+            flex-grow: 1; height: 38px; padding: 2px 4px; background: var(--input-bg);
+            border: 1px solid var(--input-border); border-radius: 10px; cursor: pointer;
+        }
         input:focus, select:focus { border-color: var(--accent); }
         select option { background: var(--dropdown-bg); color: var(--dropdown-text); }
         button { border: none; padding: 12px 16px; border-radius: 10px; cursor: pointer; font-weight: 600; font-size: 0.95rem; transition: transform 0.1s, opacity 0.2s, background-color 0.3s; }
@@ -119,6 +123,26 @@
         .leg-avg { color: var(--text-muted); font-weight: normal; font-size: 0.85rem; margin-left: 5px; }
         .box { width: 12px; height: 12px; border-radius: 3px; }
 
+        .footer {
+            margin-top: 30px;
+            padding-top: 20px;
+            text-align: center;
+            font-size: 0.9rem;
+            color: var(--text-muted);
+            border-top: 1px solid var(--glass-border);
+        }
+        .footer p { margin: 20px 0 0 0; font-size: 12px; color: var(--text-main); opacity: 0.6; }
+        .footer a {
+            color: var(--accent);
+            text-decoration: none;
+            font-weight: 600;
+            transition: opacity 0.3s ease;
+        }
+        .footer a:hover {
+            opacity: 0.8;
+            text-decoration: underline;
+        }
+
         /* Chart Tooltip */
         .chart-tooltip {
             position: fixed;
@@ -137,6 +161,55 @@
             line-height: 1.6;
             transition: opacity 0.1s;
         }
+
+        /* Toast Notification */
+        .toast {
+            visibility: hidden;
+            min-width: 200px;
+            background-color: var(--glass-bg);
+            backdrop-filter: var(--glass-blur);
+            -webkit-backdrop-filter: var(--glass-blur);
+            color: var(--text-main);
+            text-align: center;
+            border-radius: 12px;
+            padding: 12px;
+            position: fixed;
+            z-index: 2000;
+            left: 50%;
+            bottom: 20px;
+            transform: translateX(-50%);
+            border: 1px solid var(--glass-border);
+            box-shadow: var(--panel-shadow);
+            opacity: 0;
+            transition: opacity 0.3s, visibility 0.3s, bottom 0.3s;
+        }
+        .toast.show {
+            visibility: visible;
+            opacity: 1;
+            bottom: 40px;
+        }
+
+        /* Custom Modal */
+        .modal-overlay {
+            position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+            background: rgba(0, 0, 0, 0.4); z-index: 3000;
+            display: flex; align-items: center; justify-content: center;
+            opacity: 0; visibility: hidden; transition: opacity 0.3s, visibility 0.3s;
+        }
+        .modal-overlay.show { opacity: 1; visibility: visible; }
+        .modal-box {
+            background: var(--glass-bg); backdrop-filter: var(--glass-blur); -webkit-backdrop-filter: var(--glass-blur);
+            border: 1px solid var(--glass-border); border-radius: 16px; padding: 24px;
+            width: 90%; max-width: 320px; box-shadow: var(--panel-shadow); text-align: center;
+            transform: scale(0.95); transition: transform 0.3s;
+        }
+        .modal-overlay.show .modal-box { transform: scale(1); }
+        .modal-title { margin: 0 0 10px 0; font-size: 1.2rem; font-weight: 600; color: var(--text-main); }
+        .modal-message { margin: 0 0 20px 0; font-size: 0.95rem; color: var(--text-muted); line-height: 1.5; }
+        .modal-actions { display: flex; gap: 12px; }
+        .modal-actions button { margin: 0; flex: 1; }
+        .btn-cancel { background: var(--bar-bg); color: var(--text-main); border: 1px solid var(--input-border); }
+        .btn-cancel:hover { background: var(--input-border); }
 
         /* 移除原有的 box-sizing，保证 canvas 坐标系不受 border 影响 */
         canvas { 
@@ -162,7 +235,10 @@
 <body>
     <div class="header-container">
         <h2>📡 Network: <span id="ssid">Loading...</span></h2>
-        <button class="btn-danger btn-small" onclick="logout()">Logout</button>
+        <div style="display: flex; gap: 15px; align-items: center;">
+            <div style="font-weight: 600; font-size: 0.9rem; white-space: nowrap;" id="bat_status">🔋 --%</div>
+            <button class="btn-danger btn-small" style="margin: 0;" onclick="logout()">Logout</button>
+        </div>
     </div>
 
     <div class="container">
@@ -171,15 +247,34 @@
                 <h3>📺 Display & Hardware</h3>
                 <div class="row">
                     <label>💡 Brightness:</label>
-                    <input type="range" id="brightness" min="5" max="100" value="60" oninput="updateBrLabel(this.value)" onchange="setSetting(`brightness=${this.value}`)" />
+                    <input type="range" id="brightness" min="5" max="100" value="60" oninput="previewBrightness(this.value)" onchange="setSetting(`brightness=${this.value}&save=1`)" />
                     <span id="br_val">60%</span>
                 </div>
+                <div class="row">
+                    <label>🔈 Volume:</label>
+                    <input type="range" id="volume" min="0" max="100" value="80" oninput="previewVolume(this.value)" onchange="setSetting(`volume=${this.value}&save=1`)" />
+                    <span id="vol_val" style="font-weight: bold; width: 45px; text-align: right;">80%</span>
+                </div>
+                <div class="row">
+                    <label>🎨 RGB LED:</label>
+                    <input type="color" id="rgb_color" value="#000000" oninput="previewRGBColor(this.value)" onchange="setRGBColor(this.value)" />
+                    <button class="btn-warning btn-small" onclick="clearRGB()">Clear</button>
+                </div>
                 <label class="row-checkbox">
-                    <input type="checkbox" id="osd_chk" onchange="setSetting(`osd=${this.checked?1:0}`)" /> Show OSD (FPS & RSSI)
+                    <input type="checkbox" id="audio_chk" onchange="setSetting(`audio=${this.checked?1:0}&save=1`)" /> 🔊 Enable Audio Playback
+                </label>
+                <label class="row-checkbox">
+                    <input type="checkbox" id="osd_chk" onchange="setSetting(`osd=${this.checked?1:0}`)" /> Show OSD (Stats & Battery)
                 </label>
                 <label class="row-checkbox">
                     <input type="checkbox" id="time_osd_chk" onchange="setSetting(`time=${this.checked?1:0}`)" /> Show System Time
                 </label>
+                <div class="row" id="sd_format_row" style="display: none; align-items: center;">
+                    <label>💾 SD Card:</label>
+                    <span id="sd_cap_text" style="flex-grow: 1; font-size: 0.9rem; color: var(--text-muted);">---</span>
+                    <button class="btn-danger btn-small" style="width: auto;" onclick="formatSD()">Format</button>
+                    <button class="btn-warning btn-small" style="margin-left: 5px;" onclick="ejectSD()">⏏ Eject</button>
+                </div>
                 <div class="row">
                     <label>🌍 Timezone:</label>
                     <select id="tz_select" onchange="setSetting(`timezone=${encodeURIComponent(this.value)}`)">
@@ -196,6 +291,31 @@
                 <h3>🌐 Wi-Fi Configuration</h3>
                 <p class="desc-text">Device provisioned via official BLE. If you need to switch networks, click below to reset credentials and restart into provisioning mode.</p>
                 <button class="btn-warning" onclick="resetWifi()">Reset Wi-Fi & Provision</button>
+            </div>
+
+            <div class="control-panel" id="file_explorer_panel" style="display: none; grid-column: 1 / -1">
+                <div style="display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid var(--glass-border); padding-bottom: 10px; margin-bottom: 10px;">
+                    <h3 style="margin: 0; border: none; padding: 0;">📂 SD Card File Explorer</h3>
+                    <div style="display: flex; gap: 10px;">
+                        <input type="file" id="sd-upload-input" style="display: none;" onchange="uploadToSD(this)" />
+                        <button class="btn-primary btn-small" style="margin: 0; width: auto;" onclick="document.getElementById('sd-upload-input').click()">⬆ Upload</button>
+                        <button class="btn-primary btn-small" style="margin: 0; width: auto;" onclick="loadFileList()">🔄 Refresh</button>
+                    </div>
+                </div>
+                <div id="file_list_container" style="overflow-x: auto; max-height: 280px; overflow-y: auto;">
+                    <table style="width: 100%; border-collapse: collapse; text-align: left; font-size: 0.9rem;">
+                        <thead>
+                            <tr style="border-bottom: 1px solid var(--glass-border);">
+                                <th style="padding: 8px;">File Name</th>
+                                <th style="padding: 8px;">Size</th>
+                                <th style="padding: 8px; text-align: center;">Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody id="file_list_body">
+                            <tr><td colspan="3" style="text-align:center; padding: 15px; color: var(--text-muted);">Click Refresh to load files</td></tr>
+                        </tbody>
+                    </table>
+                </div>
             </div>
 
             <div class="control-panel" style="grid-column: 1 / -1">
@@ -244,24 +364,120 @@
 
         <canvas id="chart" width="760" height="300"></canvas>
     </div>
+    
+    <div class="footer">
+        <p>
+            &copy; 2026 <a href="https://github.com/NNdroid">NNdroid</a>. All rights reserved.
+        </p>
+    </div>
 
     <div id="chart-tooltip" class="chart-tooltip"></div>
+
+    <div id="toast" class="toast"></div>
+
+    <!-- Custom Modal Container -->
+    <div id="custom-modal" class="modal-overlay">
+        <div class="modal-box">
+            <h3 class="modal-title" id="modal-title">Confirm</h3>
+            <p class="modal-message" id="modal-message">Are you sure?</p>
+            <div class="modal-actions">
+                <button class="btn-cancel" id="modal-cancel">Cancel</button>
+                <button class="btn-primary" id="modal-confirm">Confirm</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Video Player Modal -->
+    <div id="player-modal" class="modal-overlay">
+        <div class="modal-box" style="max-width: 480px; width: 95%; padding: 15px;">
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
+                <h3 class="modal-title" id="player-title" style="margin: 0; font-size: 1rem; color: var(--text-main);">Playing</h3>
+                <button class="btn-cancel btn-small" style="margin: 0; padding: 4px 10px;" onclick="closePlayer()">✕</button>
+            </div>
+            <video id="mjpeg-player" controls autoplay style="width: 100%; background: #000; border-radius: 8px; min-height: 240px; object-fit: contain;"></video>
+            <a id="player-dl-btn" href="#" download class="btn-primary" style="display: block; text-decoration: none; margin-top: 15px; box-sizing: border-box;">⬇ Download File</a>
+        </div>
+    </div>
 
     <script>
         function logout() { document.cookie = "session=; Max-Age=0; path=/"; window.location.href = "/login"; }
         function updateBrLabel(v) { document.getElementById("br_val").innerText = v + "%"; }
+        function updateVolLabel(v) { document.getElementById("vol_val").innerText = v + "%"; }
         function setSetting(q) { fetch("/api/set?" + q).then((r) => { if (r.status === 401) logout(); }); }
+
+        let brThrottleTimer = false;
+        function previewBrightness(v) {
+            updateBrLabel(v); // 实时更新标签
+            if (brThrottleTimer) return;
+            brThrottleTimer = true;
+            setTimeout(() => { brThrottleTimer = false; }, 100); // 100ms 节流阀
+            setSetting(`brightness=${v}&save=0`); // 仅预览，不保存
+        }
         
-        function restartDevice() {
-            if (!confirm("Are you sure you want to restart the device? Please ensure continuous power during reboot.")) return;
+        let volThrottleTimer = false;
+        function previewVolume(v) {
+            updateVolLabel(v);
+            if (volThrottleTimer) return;
+            volThrottleTimer = true;
+            setTimeout(() => { volThrottleTimer = false; }, 100);
+            setSetting(`volume=${v}&save=0`);
+        }
+
+        let rgbThrottleTimer = false;
+        function previewRGBColor(hex) {
+            if (rgbThrottleTimer) return;
+            rgbThrottleTimer = true;
+            setTimeout(() => { rgbThrottleTimer = false; }, 100); // 100ms 节流阀，最大 10 FPS
+            sendRGB(hex, 0); // 仅做实时预览，不写入 Flash
+        }
+
+        function setRGBColor(hex) {
+            sendRGB(hex, 1); // 最终松开鼠标时，确认保存进 NVS
+        }
+
+        function sendRGB(hex, save) {
+            let r = parseInt(hex.substring(1, 3), 16);
+            let g = parseInt(hex.substring(3, 5), 16);
+            let b = parseInt(hex.substring(5, 7), 16);
+            fetch(`/api/rgb?r=${r}&g=${g}&b=${b}&save=${save}`).then((res) => { if (res.status === 401) logout(); });
+        }
+
+        function clearRGB() {
+            document.getElementById("rgb_color").value = "#000000";
+            setRGBColor("#000000");
+            showToast("已关闭指示灯");
+        }
+
+        function showToast(msg) {
+            const toast = document.getElementById("toast");
+            toast.innerText = msg;
+            toast.classList.add("show");
+            setTimeout(() => toast.classList.remove("show"), 3000);
+        }
+
+        function showConfirm(title, message, isDanger = false) {
+            return new Promise((resolve) => {
+                const overlay = document.getElementById('custom-modal');
+                document.getElementById('modal-title').innerText = title;
+                document.getElementById('modal-message').innerText = message;
+                const btnConfirm = document.getElementById('modal-confirm');
+                btnConfirm.className = isDanger ? 'btn-danger' : 'btn-primary';
+                btnConfirm.onclick = () => { overlay.classList.remove('show'); resolve(true); };
+                document.getElementById('modal-cancel').onclick = () => { overlay.classList.remove('show'); resolve(false); };
+                overlay.classList.add('show');
+            });
+        }
+
+        async function restartDevice() {
+            if (!await showConfirm("Restart Device", "Are you sure you want to restart the device? Please ensure continuous power during reboot.", true)) return;
             fetch("/api/restart", { method: "POST" }).then(res => res.json()).then(data => {
                 if (data.success) {
-                    alert("Restarting device...");
+                    showToast("Restarting device...");
                     setTimeout(() => window.location.reload(), 5000);
                 } else {
-                    alert("Restart request failed!");
+                    showToast("Restart request failed!");
                 }
-            }).catch(() => alert("Network error, cannot send restart request!"));
+            }).catch(() => showToast("Network error, cannot send restart request!"));
         }
 
         function saveNetworkConfig() {
@@ -270,17 +486,135 @@
             
             fetch(url).then(res => res.text()).then(text => {
                 if (text === "RESTART") {
-                    alert("Stream network settings modified! Device is restarting to apply socket rules. Please refresh shortly.");
+                    showToast("Stream network settings modified! Device is restarting to apply socket rules. Please refresh shortly.");
                     setTimeout(() => window.location.reload(), 3000);
                 } else {
-                    alert("Settings saved successfully!");
+                    showToast("Settings saved successfully!");
                 }
             });
         }
 
+        async function formatSD() {
+            if (!await showConfirm("Format SD Card", "Are you sure you want to format the SD card? ALL recorded videos and data will be PERMANENTLY ERASED!", true)) return;
+            
+            showToast("Formatting SD Card, please wait...");
+            fetch("/api/sd_format", { method: "POST" })
+                .then(res => {
+                    if (res.ok) {
+                        showToast("✅ SD Card formatted successfully!");
+                    } else {
+                        showToast("❌ Format failed! (Error " + res.status + ")");
+                    }
+                })
+                .catch(() => showToast("❌ Network error during format!"));
+        }
+
+        async function ejectSD() {
+            if (!await showConfirm("Eject SD Card", "Are you sure you want to safely eject the SD card? Any active recording will be stopped.", false)) return;
+            
+            showToast("Ejecting SD Card...");
+            fetch("/api/sd_eject", { method: "POST" })
+                .then(res => {
+                    if (res.ok) {
+                        showToast("✅ SD Card ejected safely! You can now remove it.");
+                    } else {
+                        showToast("❌ Eject failed! (Error " + res.status + ")");
+                    }
+                })
+                .catch(() => showToast("❌ Network error during ejection!"));
+        }
+
+        function uploadToSD(input) {
+            if (input.files.length === 0) return;
+            const file = input.files[0];
+            const fileName = file.name;
+            
+            showToast(`Uploading ${fileName}...`);
+            const xhr = new XMLHttpRequest();
+            xhr.open("POST", `/api/sd_upload?file=${encodeURIComponent(fileName)}`, true);
+            
+            xhr.onload = function() {
+                if (xhr.status === 200) {
+                    showToast(`✅ Upload successful: ${fileName}`);
+                    loadFileList(); // Refresh the list
+                } else {
+                    showToast(`❌ Upload failed (Status: ${xhr.status})`);
+                }
+                input.value = ""; // Clear input
+            };
+            
+            xhr.onerror = function() {
+                showToast("❌ Network error during upload!");
+                input.value = "";
+            };
+            
+            xhr.send(file);
+        }
+
+        function loadFileList() {
+            const tbody = document.getElementById("file_list_body");
+            tbody.innerHTML = "<tr><td colspan='3' style='text-align:center; padding: 15px; color: var(--text-muted);'>Loading...</td></tr>";
+            fetch("/api/files").then(r => {
+                if (r.status === 401) logout();
+                return r.json();
+            }).then(files => {
+                tbody.innerHTML = "";
+                if (!files || files.length === 0) {
+                    tbody.innerHTML = "<tr><td colspan='3' style='text-align:center; padding: 15px; color: var(--text-muted);'>No videos found</td></tr>";
+                    return;
+                }
+                files.sort((a,b) => b.name.localeCompare(a.name)); // 倒序排序（最新的在前）
+                files.forEach(f => {
+                    const sizeMB = (f.size / (1024*1024)).toFixed(2);
+                    const tr = document.createElement("tr");
+                    tr.style.borderBottom = "1px solid var(--glass-border)";
+                    tr.innerHTML = `
+                        <td style="padding: 10px 8px; color: var(--text-main); font-family: ui-monospace, SFMono-Regular, monospace; font-size: 0.85rem;">${f.name}</td>
+                        <td style="padding: 10px 8px; color: var(--text-muted);">${sizeMB} MB</td>
+                        <td style="padding: 10px 8px; text-align: center; white-space: nowrap;">
+                            <button class="btn-primary btn-small" style="margin: 0 4px;" onclick="playFile('${f.name}')">▶ Play</button>
+                            <a href="/sdcard/${f.name}" download class="btn-cancel btn-small" style="text-decoration:none; display:inline-block; border-radius: 10px; margin: 0; box-sizing: border-box; color: var(--text-main);">⬇ DL</a>
+                            <button class="btn-danger btn-small" style="margin: 0 4px;" onclick="deleteFile('${f.name}')">🗑 Del</button>
+                        </td>
+                    `;
+                    tbody.appendChild(tr);
+                });
+            }).catch(e => {
+                tbody.innerHTML = "<tr><td colspan='3' style='text-align:center; padding: 15px; color: var(--danger);'>Error loading files</td></tr>";
+            });
+        }
+
+        async function deleteFile(name) {
+            if (!await showConfirm("Delete File", `Are you sure you want to delete ${name}?`, true)) return;
+            
+            showToast("Deleting file...");
+            fetch(`/api/sd_delete?file=${encodeURIComponent(name)}`, { method: "POST" })
+                .then(res => {
+                    if (res.ok) {
+                        showToast(`✅ Deleted ${name}`);
+                        loadFileList();
+                    } else {
+                        showToast(`❌ Delete failed! (Error ${res.status})`);
+                    }
+                })
+                .catch(() => showToast("❌ Network error during deletion!"));
+        }
+
+        function playFile(name) {
+            document.getElementById('player-title').innerText = name;
+            document.getElementById('mjpeg-player').src = `/sdcard/${name}`;
+            document.getElementById('player-dl-btn').href = `/sdcard/${name}`;
+            document.getElementById('player-modal').classList.add('show');
+        }
+
+        function closePlayer() {
+            document.getElementById('player-modal').classList.remove('show');
+            document.getElementById('mjpeg-player').src = ""; // 强制关闭流连接
+        }
+
         function startOTA() {
             const fileInput = document.getElementById("ota-file-input");
-            if (fileInput.files.length === 0) { alert("⚠️ Please select a .bin firmware file first!"); return; }
+            if (fileInput.files.length === 0) { showToast("⚠️ Please select a .bin firmware file first!"); return; }
             const file = fileInput.files[0];
             const progressContainer = document.getElementById("ota-progress-container");
             const progressFill = document.getElementById("ota-progress-fill");
@@ -337,18 +671,18 @@
         function updateAccount() {
             let u = document.getElementById("cfg_user").value; 
             let p = document.getElementById("cfg_pwd").value;
-            if (!u || !p) { alert("Username and Password cannot be empty!"); return; }
+            if (!u || !p) { showToast("Username and Password cannot be empty!"); return; }
             fetch("/api/account?user=" + encodeURIComponent(u) + "&pwd=" + encodeURIComponent(p)).then((r) => {
-                if (r.ok) { alert("Account updated successfully! Please log in again."); logout(); } 
-                else alert("Update failed.");
+                if (r.ok) { showToast("Account updated successfully! Please log in again."); logout(); } 
+                else showToast("Update failed.");
             });
         }
 
-        function resetWifi() {
-            if (!confirm("Are you sure you want to reset Wi-Fi settings and re-enter BLE provisioning? The device will restart.")) return;
+        async function resetWifi() {
+            if (!await showConfirm("Reset Wi-Fi", "Are you sure you want to reset Wi-Fi settings and re-enter BLE provisioning? The device will restart.", true)) return;
             fetch("/api/wifi_reset", { method: "POST" }).then((r) => { 
-                if (r.ok) alert("Rebooting into BLE provisioning mode!"); 
-                else alert("Operation failed."); 
+                if (r.ok) showToast("Rebooting into BLE provisioning mode!"); 
+                else showToast("Operation failed."); 
             });
         }
 
@@ -359,10 +693,10 @@
             textArea.style.position = "fixed"; textArea.style.top = "-9999px"; textArea.style.left = "-9999px";
             document.body.appendChild(textArea); textArea.focus(); textArea.select();
             try { 
-                if (document.execCommand("copy")) alert("✅ Copied to clipboard!"); 
-                else alert("❌ Copy failed. Please select and copy manually."); 
+                if (document.execCommand("copy")) showToast("✅ Copied to clipboard!"); 
+                else showToast("❌ Copy failed. Please select and copy manually."); 
             } catch (err) { 
-                alert("❌ Your browser does not support clipboard API."); 
+                showToast("❌ Your browser does not support clipboard API."); 
             }
             document.body.removeChild(textArea);
         }
@@ -371,7 +705,7 @@
         const cvs = document.getElementById("chart"); 
         const ctx = cvs.getContext("2d"); 
         const tooltip = document.getElementById("chart-tooltip");
-        const maxP = 30; 
+        const maxP = 60; 
         let hist = []; 
         let initSync = false;
         let hoverIdx = -1; // 当前鼠标悬停的数据点索引
@@ -415,7 +749,7 @@
             // 绘制 X 轴时间刻度
             ctx.textBaseline = "top";
             ctx.textAlign = "center";
-            ctx.fillText("-30s", padX, cvs.height - padY + 10);
+            ctx.fillText("-60s", padX, cvs.height - padY + 10);
             ctx.fillText("0s (Now)", cvs.width - padX, cvs.height - padY + 10);
 
             if (hist.length === 0) return;
@@ -533,17 +867,45 @@
                 document.getElementById("v_fps").innerText = d.fps; 
                 document.getElementById("v_rssi").innerText = d.rssi;
 
-                let cmd = `ffmpeg -fflags nobuffer+discardcorrupt+genpts -max_delay 0 -flags low_delay -use_wallclock_as_timestamps 1 -probesize 50000 -analyzeduration 100000 -i "rtsp://[YOUR_SOURCE]" -vf "fps=25,scale=320:240" -an -c:v mjpeg -q:v 3 -pix_fmt yuvj420p -f mpegts "udp://${d.ip}:${d.udp_port}?pkt_size=1316&buffer_size=65535"`;
+                const formatRow = document.getElementById("sd_format_row");
+                const fePanel = document.getElementById("file_explorer_panel");
+                if (d.sd_mounted) {
+                    formatRow.style.display = "flex";
+                    fePanel.style.display = "block";
+                    document.getElementById("sd_cap_text").innerText = `${d.sd_free_mb} MB Free / ${d.sd_total_mb} MB Total`;
+                } else {
+                    formatRow.style.display = "none";
+                    fePanel.style.display = "none";
+                }
+
+                if (d.bat_pct !== undefined) {
+                    const batEl = document.getElementById("bat_status");
+                    batEl.innerText = `🔋 ${d.bat_pct}% (${(d.bat_mv / 1000).toFixed(2)}V)`;
+                    if (d.bat_pct < 20) batEl.style.color = "var(--danger)";
+                    else if (d.bat_pct < 50) batEl.style.color = "var(--warning)";
+                    else batEl.style.color = "var(--success)";
+                }
+
+                let cmd = `ffmpeg -fflags nobuffer+discardcorrupt+genpts -max_delay 0 -flags low_delay -use_wallclock_as_timestamps 1 -probesize 50000 -analyzeduration 100000 -i "rtsp://[YOUR_SOURCE]" -an -vf "fps=25,scale=320:240" -c:v mjpeg -q:v 3 -pix_fmt yuvj420p -f mpegts "udp://${d.ip}:${d.udp_port}?pkt_size=1316" -vn -c:a pcm_s16le -ar 44100 -ac 2 -f s16le "udp://${d.ip}:${d.udp_port + 1}?pkt_size=1024"`;
                 document.getElementById("ffmpeg_cmd").innerText = cmd;
 
                 if (!initSync) {
                     document.getElementById("brightness").value = d.brightness; 
                     updateBrLabel(d.brightness);
+                    document.getElementById("volume").value = d.volume; 
+                    updateVolLabel(d.volume);
                     document.getElementById("osd_chk").checked = d.osd === 1;
                     document.getElementById("time_osd_chk").checked = d.time_osd === 1;
+                    document.getElementById("audio_chk").checked = d.audio === 1;
                     if(d.timezone) document.getElementById("tz_select").value = d.timezone;
                     document.getElementById("cfg_user").value = d.user;
                     document.getElementById("udp_port").value = d.udp_port;
+                    
+                    let rHex = d.rgb_r.toString(16).padStart(2, '0');
+                    let gHex = d.rgb_g.toString(16).padStart(2, '0');
+                    let bHex = d.rgb_b.toString(16).padStart(2, '0');
+                    document.getElementById("rgb_color").value = `#${rHex}${gHex}${bHex}`;
+                    
                     initSync = true;
                 }
                 

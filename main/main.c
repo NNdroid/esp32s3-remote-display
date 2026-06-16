@@ -2,6 +2,8 @@
 #include <string.h>
 #include <ctype.h>
 #include <errno.h> // 用于 Socket 错误码处理
+#include <dirent.h>
+#include <sys/stat.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
@@ -23,10 +25,10 @@
 #include "esp_sntp.h"
 #include "esp_task_wdt.h"
 
-// 官方空闲钩子组件头文件
+// 空闲钩子组件头文件
 #include "esp_freertos_hooks.h"
 
-// V6 官方蓝牙配网库
+// 蓝牙配网库
 #include "network_provisioning/manager.h"
 #include "network_provisioning/scheme_ble.h"
 
@@ -35,15 +37,38 @@
 #include "esp_lcd_panel_ops.h"
 #include "esp_lcd_ili9341.h"
 #include "driver/gpio.h"
+#include "driver/i2c_master.h"
 #include "driver/spi_master.h"
 #include "driver/ledc.h"
+#include "led_strip.h"
+#include "esp_vfs_fat.h"
+#include "sdmmc_cmd.h"
+#include "driver/sdmmc_host.h"
+
+#include "esp_idf_version.h"
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 0, 0)
+#include "driver/i2s_std.h"
+#else
+#include "driver/i2s.h"
+#endif
+
+#include "esp_adc/adc_oneshot.h"
+#include "esp_adc/adc_cali.h"
+#include "esp_adc/adc_cali_scheme.h"
+
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 3, 0)
+#define MY_ADC_ATTEN ADC_ATTEN_DB_12
+#else
+#define MY_ADC_ATTEN ADC_ATTEN_DB_11
+#endif
 
 // 高性能解码器
 #include "esp_jpeg_dec.h"
+#include "esp_jpeg_enc.h"
 
 #define FRAME_BUF_SIZE 122880
 
-// 屏幕分辨率巨集
+// 屏幕分辨率
 #define LCD_WIDTH 320
 #define LCD_HEIGHT 240
 #define LCD_PIXELS (LCD_WIDTH * LCD_HEIGHT)
@@ -57,14 +82,38 @@
 #define TFT_RST -1
 #define TFT_BL 45
 
-#define DISPLAY_BUF_NUM 5
+#define DISPLAY_BUF_NUM 12
 #define RX_BUF_NUM 12
+
+// SD 卡引脚定义 (请根据你的硬件连接修改)
+#define SD_PIN_CLK 38
+#define SD_PIN_CMD 40
+#define SD_PIN_D0  39
+#define SD_PIN_D1  41
+#define SD_PIN_D2  48
+#define SD_PIN_D3  47
+
+#define MOUNT_POINT "/sdcard"
+
+#define RGB_LED_PIN 42
+
+// Audio I2S Pins
+#define PA_EN_PIN 1
+#define I2S_MCLK_PIN 4
+#define I2S_BCLK_PIN 5
+#define I2S_DOUT_PIN 8
+#define I2S_LRCK_PIN 7
+#define I2S_DIN_PIN  -1 // 不需要麦克风输入，设为 -1 释放引脚
+
+#define I2C_SDA_PIN 16
+#define I2C_SCL_PIN 15
 
 // ==================== 全局状态与持久化配置 ====================
 volatile int g_current_fps = 0;
 volatile int8_t g_current_rssi = 0;
 
 volatile int32_t g_current_brightness = 60;
+volatile int32_t g_current_volume = 80;
 volatile int8_t g_show_osd = 1;
 volatile bool g_show_time_osd = true;
 char g_admin_user[32] = "admin";
@@ -76,6 +125,30 @@ char g_timezone[32] = "CST-8";
 volatile int32_t g_udp_port = 8888;
 
 volatile bool g_is_provisioning = false;
+volatile bool g_sd_card_mounted = false;
+volatile bool g_is_playing_from_sd = false;
+volatile bool g_stop_playback = false;
+
+volatile uint8_t g_rgb_r = 0, g_rgb_g = 0, g_rgb_b = 0;
+char g_syslog_host[64] = "";
+volatile int8_t g_syslog_enable = 0;
+
+volatile int8_t g_audio_enable = 1;
+
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 0, 0)
+static i2s_chan_handle_t tx_chan;
+#endif
+
+static TaskHandle_t s_sd_playback_task_handle = NULL;
+static char s_playback_filename[128];
+
+static i2c_master_dev_handle_t es8311_dev_handle = NULL;
+
+volatile int g_battery_voltage_mv = 0;
+volatile int g_battery_percentage = 0;
+static adc_oneshot_unit_handle_t adc1_handle = NULL;
+static adc_cali_handle_t adc1_cali_handle = NULL;
+static bool do_calibration = false;
 
 char g_prov_pop[9] = "";
 uint8_t g_prov_uuid[16] = {0};
@@ -121,6 +194,9 @@ extern const uint8_t index_html_start[] asm("_binary_index_html_start");
 extern const uint8_t index_html_end[] asm("_binary_index_html_end");
 extern const uint8_t login_html_start[] asm("_binary_login_html_start");
 extern const uint8_t login_html_end[] asm("_binary_login_html_end");
+
+static led_strip_handle_t s_led_strip = NULL;
+static sdmmc_card_t *s_card;
 
 // ==================== 辅助工具函数声明与实现 ====================
 static void url_decode_safe(char *dst, const char *src, size_t max_len)
@@ -430,6 +506,10 @@ static void load_settings_from_nvs()
         if (nvs_get_i32(my_handle, "brightness", &saved_br) == ESP_OK)
             g_current_brightness = saved_br;
 
+        int32_t saved_vol = 80;
+        if (nvs_get_i32(my_handle, "volume", &saved_vol) == ESP_OK)
+            g_current_volume = saved_vol;
+
         int8_t saved_osd = 1;
         if (nvs_get_i8(my_handle, "show_osd", &saved_osd) == ESP_OK)
             g_show_osd = saved_osd;
@@ -470,6 +550,15 @@ static void load_settings_from_nvs()
             nvs_set_blob(my_handle, "prov_uuid", g_prov_uuid, sizeof(g_prov_uuid));
         }
 
+        uint8_t u8_tmp = 0;
+        if (nvs_get_u8(my_handle, "rgb_r", &u8_tmp) == ESP_OK) g_rgb_r = u8_tmp;
+        if (nvs_get_u8(my_handle, "rgb_g", &u8_tmp) == ESP_OK) g_rgb_g = u8_tmp;
+        if (nvs_get_u8(my_handle, "rgb_b", &u8_tmp) == ESP_OK) g_rgb_b = u8_tmp;
+
+        int8_t saved_audio = 1;
+        if (nvs_get_i8(my_handle, "audio_enable", &saved_audio) == ESP_OK)
+            g_audio_enable = saved_audio;
+
         nvs_commit(my_handle);
         nvs_close(my_handle);
     }
@@ -505,6 +594,16 @@ static void save_str_to_nvs(const char *key, const char *val)
         nvs_close(my_handle);
     }
 }
+static void save_u8_to_nvs(const char *key, uint8_t val)
+{
+    nvs_handle_t my_handle;
+    if (nvs_open("storage", NVS_READWRITE, &my_handle) == ESP_OK)
+    {
+        nvs_set_u8(my_handle, key, val);
+        nvs_commit(my_handle);
+        nvs_close(my_handle);
+    }
+}
 
 // ==================== 硬件初始化 ====================
 static void lcd_hardware_init(void)
@@ -522,7 +621,7 @@ static void lcd_hardware_init(void)
     gpio_set_drive_capability(TFT_CS, GPIO_DRIVE_CAP_3);
     gpio_set_drive_capability(TFT_DC, GPIO_DRIVE_CAP_3);
 
-    esp_lcd_panel_io_spi_config_t io_config = {.dc_gpio_num = TFT_DC, .cs_gpio_num = TFT_CS, .pclk_hz = 40 * 1000 * 1000, .lcd_cmd_bits = 8, .lcd_param_bits = 8, .spi_mode = 0, .trans_queue_depth = 20};
+    esp_lcd_panel_io_spi_config_t io_config = {.dc_gpio_num = TFT_DC, .cs_gpio_num = TFT_CS, .pclk_hz = 58 * 1000 * 1000, .lcd_cmd_bits = 8, .lcd_param_bits = 8, .spi_mode = 0, .trans_queue_depth = 20};
     ESP_ERROR_CHECK(esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)LCD_HOST, &io_config, &io_handle));
     esp_lcd_panel_dev_config_t panel_config = {.reset_gpio_num = TFT_RST, .bits_per_pixel = 16};
     ESP_ERROR_CHECK(esp_lcd_new_panel_ili9341(io_handle, &panel_config, &panel_handle));
@@ -542,6 +641,281 @@ static void lcd_hardware_init(void)
     ledc_timer_config(&ledc_timer);
     ledc_channel_config_t ledc_channel = {.speed_mode = LEDC_LOW_SPEED_MODE, .channel = LEDC_CHANNEL_0, .timer_sel = LEDC_TIMER_0, .intr_type = LEDC_INTR_DISABLE, .gpio_num = TFT_BL, .duty = init_duty, .hpoint = 0};
     ledc_channel_config(&ledc_channel);
+}
+
+static void sd_card_init(void)
+{
+    // If already mounted, check if it's still accessible.
+    if (g_sd_card_mounted) {
+        uint64_t total, free;
+        if (esp_vfs_fat_info(MOUNT_POINT, &total, &free) == ESP_OK) {
+            return; // Still OK, do nothing.
+        } else {
+            ESP_LOGW("SD", "Card was mounted but is now inaccessible. Unmounting.");
+            esp_vfs_fat_sdcard_unmount(MOUNT_POINT, s_card);
+            g_sd_card_mounted = false;
+        }
+    }
+
+    esp_err_t ret;
+    esp_vfs_fat_sdmmc_mount_config_t mount_config = {
+        .format_if_mount_failed = true,
+        .max_files = 5,
+        .allocation_unit_size = 16 * 1024
+    };
+
+    sdmmc_host_t host = SDMMC_HOST_DEFAULT();
+    host.max_freq_khz = SDMMC_FREQ_DEFAULT;
+
+    sdmmc_slot_config_t slot_config = SDMMC_SLOT_CONFIG_DEFAULT();
+    slot_config.width = 4; // 4-line mode
+    slot_config.clk = SD_PIN_CLK;
+    slot_config.cmd = SD_PIN_CMD;
+    slot_config.d0 = SD_PIN_D0;
+    slot_config.d1 = SD_PIN_D1;
+    slot_config.d2 = SD_PIN_D2;
+    slot_config.d3 = SD_PIN_D3;
+
+    ret = esp_vfs_fat_sdmmc_mount(MOUNT_POINT, &host, &slot_config, &mount_config, &s_card);
+
+    if (ret != ESP_OK) {
+        // Don't log error if it's just not found, that's expected on boot without card.
+        if (ret != ESP_ERR_NOT_FOUND) {
+             ESP_LOGE("SD", "Failed to mount SD card (%s).", esp_err_to_name(ret));
+        }
+        g_sd_card_mounted = false;
+    } else {
+        ESP_LOGI("SD", "SD card mounted at %s", MOUNT_POINT);
+        sdmmc_card_print_info(stdout, s_card);
+        g_sd_card_mounted = true;
+    }
+}
+
+static void rgb_led_init(void)
+{
+    led_strip_config_t strip_config = {
+        .strip_gpio_num = RGB_LED_PIN,
+        .max_leds = 1, // 这里假定只有一颗灯珠，如有多颗可自行修改
+    };
+    led_strip_rmt_config_t rmt_config = {
+        .resolution_hz = 10 * 1000 * 1000, // 10MHz
+    };
+    if (led_strip_new_rmt_device(&strip_config, &rmt_config, &s_led_strip) == ESP_OK) {
+        led_strip_set_pixel(s_led_strip, 0, g_rgb_r, g_rgb_g, g_rgb_b);
+        led_strip_refresh(s_led_strip);
+    }
+}
+
+static esp_err_t es8311_write_reg(uint8_t reg, uint8_t val) {
+    if (!es8311_dev_handle) return ESP_FAIL;
+    uint8_t data[2] = {reg, val};
+    esp_err_t err = i2c_master_transmit(es8311_dev_handle, data, sizeof(data), pdMS_TO_TICKS(100));
+    if (err != ESP_OK) {
+        ESP_LOGE("ES8311", "I2C Write Failed! Reg: 0x%02X, Err: %s", reg, esp_err_to_name(err));
+    }
+    return err;
+}
+
+static void es8311_codec_init(void) {
+    i2c_master_bus_config_t i2c_bus_cfg = {
+        .i2c_port = I2C_NUM_0,
+        .sda_io_num = I2C_SDA_PIN,
+        .scl_io_num = I2C_SCL_PIN,
+        .clk_source = I2C_CLK_SRC_DEFAULT,
+        .glitch_ignore_cnt = 7,
+        .flags.enable_internal_pullup = true,
+    };
+    i2c_master_bus_handle_t bus_handle;
+    ESP_ERROR_CHECK(i2c_new_master_bus(&i2c_bus_cfg, &bus_handle));
+
+    i2c_device_config_t i2c_dev_cfg = {
+        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+        .device_address = 0x18, 
+        .scl_speed_hz = 400000,
+    };
+    ESP_ERROR_CHECK(i2c_master_bus_add_device(bus_handle, &i2c_dev_cfg, &es8311_dev_handle));
+
+    // ES8311 寄存器初始化序列 (44.1kHz, 16bit, Slave 接收模式)
+    // 完全复刻官方库 es8311_init 与 es8311_sample_frequency_config 逻辑
+    es8311_write_reg(0x00, 0x1F); vTaskDelay(pdMS_TO_TICKS(30)); // Reset
+    es8311_write_reg(0x00, 0x00);
+    es8311_write_reg(0x00, 0x80); // Power-on command (CSM=1)
+    
+    es8311_write_reg(0x01, 0x3F); // Clock config: Enable all clocks
+    es8311_write_reg(0x02, 0x00); // MCLK pre-div=1, pre-multi=1x
+    es8311_write_reg(0x03, 0x10); // fs_mode=ss, adc_osr=16
+    es8311_write_reg(0x04, 0x10); // dac_osr=16
+    es8311_write_reg(0x05, 0x00); // adc_div=1, dac_div=1
+    es8311_write_reg(0x06, 0x03); // bclk_div=4
+    es8311_write_reg(0x07, 0x00); // lrck_h=0
+    es8311_write_reg(0x08, 0xFF); // lrck_l=255
+    
+    es8311_write_reg(0x09, 0x0C); // SDP IN: 16-bit
+    es8311_write_reg(0x0A, 0x0C); // SDP OUT: 16-bit
+    
+    es8311_write_reg(0x0D, 0x01); // Power up analog circuitry
+    es8311_write_reg(0x0E, 0x02); // Enable analog PGA, enable ADC modulator
+    es8311_write_reg(0x12, 0x00); // Power-up DAC
+    es8311_write_reg(0x13, 0x10); // Enable output to HP drive (Crucial!)
+    es8311_write_reg(0x1C, 0x6A); // ADC Equalizer bypass
+    es8311_write_reg(0x37, 0x08); // Bypass DAC equalizer
+    
+    es8311_write_reg(0x31, 0x00); // DAC unmute
+
+    es8311_write_reg(0x32, 0); // Set initial volume to 0 to prevent pop
+}
+
+static void audio_hardware_init(void)
+{
+    // PA 使能引脚初始化 (低电平使能)
+    gpio_config_t io_conf = {
+        .pin_bit_mask = (1ULL << PA_EN_PIN),
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = 0,
+        .pull_down_en = 0,
+        .intr_type = GPIO_INTR_DISABLE
+    };
+    gpio_config(&io_conf);
+    gpio_set_level(PA_EN_PIN, 1); // Keep PA disabled initially to prevent pop
+
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 0, 0)
+    i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_AUTO, I2S_ROLE_MASTER);
+    ESP_ERROR_CHECK(i2s_new_channel(&chan_cfg, &tx_chan, NULL));
+
+    i2s_std_config_t std_cfg = {
+        .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(44100),
+        .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO),
+        .gpio_cfg = {
+            .mclk = I2S_MCLK_PIN,
+            .bclk = I2S_BCLK_PIN,
+            .ws = I2S_LRCK_PIN,
+            .dout = I2S_DOUT_PIN,
+            .din = I2S_DIN_PIN,
+            .invert_flags = {
+                .mclk_inv = false,
+                .bclk_inv = false,
+                .ws_inv = false,
+            },
+        },
+    };
+    ESP_ERROR_CHECK(i2s_channel_init_std_mode(tx_chan, &std_cfg));
+    ESP_ERROR_CHECK(i2s_channel_enable(tx_chan));
+#else
+    i2s_config_t i2s_config = {
+        .mode = I2S_MODE_MASTER | I2S_MODE_TX,
+        .sample_rate = 44100,
+        .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
+        .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT,
+        .communication_format = I2S_COMM_FORMAT_STAND_I2S,
+        .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
+        .dma_buf_count = 6,
+        .dma_buf_len = 512,
+        .use_apll = false, // ESP32-S3 硬件不支持 APLL，使用默认时钟即可
+        .tx_desc_auto_clear = true
+    };
+    i2s_pin_config_t pin_config = {
+        .mck_io_num = I2S_MCLK_PIN,
+        .bck_io_num = I2S_BCLK_PIN,
+        .ws_io_num = I2S_LRCK_PIN,
+        .data_out_num = I2S_DOUT_PIN,
+        .data_in_num = I2S_DIN_PIN
+    };
+    ESP_ERROR_CHECK(i2s_driver_install(I2S_NUM_0, &i2s_config, 0, NULL));
+    ESP_ERROR_CHECK(i2s_set_pin(I2S_NUM_0, &pin_config));
+    ESP_ERROR_CHECK(i2s_zero_dma_buffer(I2S_NUM_0));
+#endif
+
+    // 必须在 I2S 时钟 (MCLK) 启动后，再初始化 ES8311，否则它可能无法响应配置
+    es8311_codec_init();
+
+    // After codec is configured and stable, enable the PA and ramp up volume
+    if (g_audio_enable) {
+        gpio_set_level(PA_EN_PIN, 0); // Enable PA (low level)
+        ESP_LOGI("AUDIO", "Ramping up volume for soft start...");
+        for (int i = 0; i <= g_current_volume; i++) {
+            uint8_t vol_reg = i == 0 ? 0 : ((i * 256 / 100) - 1);
+            es8311_write_reg(0x32, vol_reg);
+            vTaskDelay(pdMS_TO_TICKS(3)); // 3ms per step for a smoother fade-in
+        }
+        ESP_LOGI("AUDIO", "Volume ramp-up complete.");
+    }
+}
+
+static void battery_adc_init(void)
+{
+    adc_oneshot_unit_init_cfg_t init_config = {
+        .unit_id = ADC_UNIT_1,
+    };
+    ESP_ERROR_CHECK(adc_oneshot_new_unit(&init_config, &adc1_handle));
+
+    adc_oneshot_chan_cfg_t config = {
+        .bitwidth = ADC_BITWIDTH_DEFAULT,
+        .atten = MY_ADC_ATTEN,
+    };
+    ESP_ERROR_CHECK(adc_oneshot_config_channel(adc1_handle, ADC_CHANNEL_8, &config)); // IO9 是 ESP32-S3 的 ADC1_CH8
+
+    adc_cali_curve_fitting_config_t cali_config = {
+        .unit_id = ADC_UNIT_1,
+        .chan = ADC_CHANNEL_8,
+        .atten = MY_ADC_ATTEN,
+        .bitwidth = ADC_BITWIDTH_DEFAULT,
+    };
+    if (adc_cali_create_scheme_curve_fitting(&cali_config, &adc1_cali_handle) == ESP_OK) {
+        do_calibration = true;
+    }
+}
+
+void audio_receiver_task(void *pvParameters) {
+    int rcv_buf_size = 32768; // 音频包小，32K缓冲区足矣
+    struct timeval timeout = { .tv_sec = 1, .tv_usec = 0 };
+    uint8_t *read_buf = (uint8_t *)malloc(4096); // 移至堆内存，防截断且保护 4KB 任务栈
+    if (!read_buf) {
+        ESP_LOGE("AUDIO", "Failed to allocate audio read buffer");
+        vTaskDelete(NULL);
+    }
+    static bool first_audio = true;
+
+    while (1) {
+        xEventGroupWaitBits(s_wifi_event_group, WIFI_CONNECTED_BIT, pdFALSE, pdTRUE, portMAX_DELAY);
+        int sock = socket(AF_INET6, SOCK_DGRAM, IPPROTO_IP);
+        if (sock < 0) { vTaskDelay(pdMS_TO_TICKS(1000)); continue; }
+
+        int v6only = 0;
+        setsockopt(sock, IPPROTO_IPV6, IPV6_V6ONLY, &v6only, sizeof(v6only));
+        setsockopt(sock, SOL_SOCKET, SO_RCVBUF, &rcv_buf_size, sizeof(rcv_buf_size));
+        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+
+        struct sockaddr_in6 dest_addr = { 0 };
+        dest_addr.sin6_family = AF_INET6;
+        dest_addr.sin6_port = htons(g_udp_port + 1); // 独立接收音频端口 (视频端口 + 1)
+        dest_addr.sin6_addr = in6addr_any;
+
+        if (bind(sock, (struct sockaddr *)&dest_addr, sizeof(dest_addr)) < 0) {
+            close(sock); vTaskDelay(pdMS_TO_TICKS(1000)); continue;
+        }
+        while (1) {
+            if ((xEventGroupGetBits(s_wifi_event_group) & WIFI_CONNECTED_BIT) == 0) break;
+            int len = recvfrom(sock, read_buf, 4096, 0, NULL, NULL);
+            
+            if (len > 0 && first_audio) {
+                ESP_LOGW("AUDIO", "✅ First audio packet received! Length: %d bytes", len);
+                first_audio = false; // 打印日志以确认网络包已成功到达音频端口
+            }
+
+            if (len > 0) {
+                if (g_audio_enable) {
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 0, 0)
+                    size_t bytes_written = 0;
+                    i2s_channel_write(tx_chan, read_buf, len, &bytes_written, portMAX_DELAY);
+#else
+                    size_t bytes_written = 0;
+                    i2s_write(I2S_NUM_0, read_buf, len, &bytes_written, portMAX_DELAY);
+#endif
+                }
+            } else if (errno != EAGAIN && errno != EWOULDBLOCK) vTaskDelay(pdMS_TO_TICKS(10));
+        }
+        close(sock);
+    }
 }
 
 void jpeg_decode_display_task(void *pvParameters)
@@ -635,8 +1009,7 @@ void jpeg_decode_display_task(void *pvParameters)
                 {
                     fps_counter++;
                     TickType_t now = xTaskGetTickCount();
-
-                    static char cached_osd_str[32] = {0}, cached_time_str[32] = {0}, cached_heap_str[32] = {0}, cached_cpu_str[32] = {0}, cached_net_str[32] = {0}, cached_bssid_str[32] = {0};
+                    static char cached_osd_str[32] = {0}, cached_time_str[32] = {0}, cached_heap_str[32] = {0}, cached_cpu_str[32] = {0}, cached_net_str[32] = {0}, cached_bssid_str[32] = {0}, cached_sd_str[32] = {0}, cached_bat_str[16] = {0};
                     static int cached_time_width = 0;
 
                     if (now - last_fps_time >= pdMS_TO_TICKS(1000))
@@ -685,6 +1058,16 @@ void jpeg_decode_display_task(void *pvParameters)
                         snprintf(cached_net_str, sizeof(cached_net_str), "DL:%luKB/s", (unsigned long)g_current_rx_speed_kbps);
                         strncpy(cached_bssid_str, (const char *)g_async_wifi_bssid, sizeof(cached_bssid_str) - 1);
 
+                        if (g_sd_card_mounted) {
+                            uint64_t sd_total = 0, sd_free = 0;
+                            esp_vfs_fat_info(MOUNT_POINT, &sd_total, &sd_free);
+                            uint32_t free_mb = sd_free / (1024 * 1024);
+                            snprintf(cached_sd_str, sizeof(cached_sd_str), "SD:%s %luMB", g_is_playing_from_sd ? "PLAY" : "IDLE", (unsigned long)free_mb);
+                        } else {
+                            cached_sd_str[0] = '\0';
+                        }
+                        snprintf(cached_bat_str, sizeof(cached_bat_str), "BAT:%d%%", g_battery_percentage);
+
                         time_t now_time;
                         struct tm timeinfo;
                         time(&now_time);
@@ -699,6 +1082,18 @@ void jpeg_decode_display_task(void *pvParameters)
 
                     if (g_show_osd)
                     {
+                        if (cached_bat_str[0] != '\0')
+                        {
+                            draw_string_8x8_transparent_fast(full_frame, 2, LCD_HEIGHT - 70, cached_bat_str, 0x07E0);
+                        }
+                        if (cached_sd_str[0] != '\0')
+                        {
+                            uint16_t sd_color = 0x07E0; // 默认绿色
+                            if (g_is_playing_from_sd) {
+                                sd_color = ((xTaskGetTickCount() / pdMS_TO_TICKS(500)) % 2 == 0) ? 0x07E0 : 0xFFFF; // 播放时绿白闪烁
+                            }
+                            draw_string_8x8_transparent_fast(full_frame, 2, LCD_HEIGHT - 60, cached_sd_str, sd_color);
+                        }
                         if (cached_bssid_str[0] != '\0')
                         {
                             draw_string_8x8_transparent_fast(full_frame, 2, LCD_HEIGHT - 50, cached_bssid_str, 0xFFFF);
@@ -736,7 +1131,6 @@ void jpeg_decode_display_task(void *pvParameters)
             }
             jpeg_dec_close(jpeg_dec);
             xQueueSend(free_queue, &current_frame, 0);
-            vTaskDelay(1);
         }
         else
         {
@@ -760,7 +1154,164 @@ void jpeg_decode_display_task(void *pvParameters)
     }
 }
 
-void udp_receiver_task(void *pvParameters) {
+void sd_playback_task(void *pvParameters)
+{
+    uint8_t *file_read_buf = (uint8_t *)malloc(188 * 64); // ~12KB buffer
+    if (!file_read_buf) {
+        ESP_LOGE("PLAY", "Failed to allocate file read buffer!");
+        vTaskDelete(NULL);
+    }
+
+    rx_frame_t current_rx_frame;
+    bool has_active_buffer = false;
+    uint32_t current_frame_len = 0;
+    bool frame_corrupted = true;
+    int8_t last_video_cc = -1;
+    uint16_t video_pid = 0x1FFF;
+    int8_t last_audio_cc = -1;
+    uint16_t audio_pid = 0x1FFF;
+
+    while (1) {
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY); // Wait for a play command
+
+        g_is_playing_from_sd = true;
+        g_stop_playback = false;
+        video_pid = 0x1FFF;
+        audio_pid = 0x1FFF;
+        frame_corrupted = true;
+        has_active_buffer = false;
+
+        char filepath[200];
+        snprintf(filepath, sizeof(filepath), "%s/%s", MOUNT_POINT, s_playback_filename);
+
+        FILE *f = fopen(filepath, "r");
+        if (!f) {
+            ESP_LOGE("PLAY", "Failed to open %s", filepath);
+            g_is_playing_from_sd = false;
+            continue;
+        }
+        ESP_LOGI("PLAY", "Playing %s...", filepath);
+
+        while (!g_stop_playback) {
+            size_t bytes_read = fread(file_read_buf, 1, 188 * 64, f);
+            if (bytes_read == 0) break; // End of file
+
+            for (int offset = 0; offset <= (int)bytes_read - 188; offset += 188) {
+                if (g_stop_playback) break;
+
+                uint8_t *ts = &file_read_buf[offset];
+                if (ts[0] != 0x47) continue;
+
+                uint16_t pid = ((ts[1] & 0x1F) << 8) | ts[2];
+                uint8_t pusi = (ts[1] & 0x40) >> 6;
+                uint8_t afc = (ts[3] & 0x30) >> 4;
+                uint8_t cc = ts[3] & 0x0F;
+
+                if (afc == 0 || afc == 2) continue;
+
+                int payload_offset = 4;
+                if (afc == 3) payload_offset += 1 + ts[4];
+                if (payload_offset >= 188) continue;
+
+                uint8_t *payload = &ts[payload_offset];
+                int payload_len = 188 - payload_offset;
+
+                if (pusi) {
+                    if (payload_len >= 6 && payload[0] == 0x00 && payload[1] == 0x00 && payload[2] == 0x01) {
+                        if (payload[3] == 0xE0) { // Video PES
+                            video_pid = pid;
+                            int pes_header_len = 9 + payload[8];
+                            if (payload_len > pes_header_len) {
+                                payload += pes_header_len;
+                                payload_len -= pes_header_len;
+                                if (!has_active_buffer && xQueueReceive(free_queue, &current_rx_frame, 0) == pdTRUE) {
+                                    has_active_buffer = true;
+                                }
+                                if (has_active_buffer) {
+                                    current_frame_len = 0;
+                                    frame_corrupted = false;
+                                    last_video_cc = cc;
+                                } else {
+                                    frame_corrupted = true;
+                                }
+                            } else continue;
+                        } else if ((payload[3] & 0xF0) == 0xC0) { // Audio PES
+                            audio_pid = pid;
+                            last_audio_cc = cc;
+                            int pes_header_len = 9 + payload[8];
+                            if (payload_len > pes_header_len) {
+                                payload += pes_header_len;
+                                payload_len -= pes_header_len;
+                                if (g_audio_enable) {
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 0, 0)
+                                    size_t bytes_written = 0;
+                                    i2s_channel_write(tx_chan, payload, payload_len, &bytes_written, portMAX_DELAY);
+#else
+                                    size_t bytes_written = 0;
+                                    i2s_write(I2S_NUM_0, payload, payload_len, &bytes_written, portMAX_DELAY);
+#endif
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if (pid == video_pid && has_active_buffer && !frame_corrupted) {
+                    if (!pusi) {
+                        int expected_cc = (last_video_cc + 1) & 0x0F;
+                        if (cc != expected_cc) {
+                            ESP_LOGW("PLAY", "Video packet drop! Expected CC %d, got %d.", expected_cc, cc);
+                            frame_corrupted = true;
+                        }
+                        last_video_cc = cc;
+                    }
+                    if (!frame_corrupted) {
+                        if (current_frame_len + payload_len <= FRAME_BUF_SIZE) {
+                            memcpy(current_rx_frame.buf_ptr + current_frame_len, payload, payload_len);
+                            current_frame_len += payload_len;
+                            if (current_frame_len >= 2 && current_rx_frame.buf_ptr[current_frame_len - 2] == 0xFF && current_rx_frame.buf_ptr[current_frame_len - 1] == 0xD9) {
+                                current_rx_frame.len = current_frame_len;
+                                if (xQueueSend(jpeg_queue, &current_rx_frame, 0) == pdTRUE) {
+                                    has_active_buffer = false;
+                                }
+                                frame_corrupted = true;
+                            }
+                        } else {
+                            ESP_LOGW("PLAY", "Video frame overflow!");
+                            frame_corrupted = true;
+                        }
+                    }
+                }
+                if (pid == audio_pid && !pusi) {
+                    int expected_cc = (last_audio_cc + 1) & 0x0F;
+                    if (cc != expected_cc) {
+                        ESP_LOGW("PLAY", "Audio packet drop! Expected CC %d, got %d.", expected_cc, cc);
+                    } else if (g_audio_enable) {
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 0, 0)
+                        size_t bytes_written = 0;
+                        i2s_channel_write(tx_chan, payload, payload_len, &bytes_written, portMAX_DELAY);
+#else
+                        size_t bytes_written = 0;
+                        i2s_write(I2S_NUM_0, payload, payload_len, &bytes_written, portMAX_DELAY);
+#endif
+                    }
+                    last_audio_cc = cc;
+                }
+            }
+        }
+
+        fclose(f);
+        if (has_active_buffer) {
+            xQueueSend(free_queue, &current_rx_frame, 0);
+        }
+        ESP_LOGI("PLAY", "Playback finished.");
+        g_is_playing_from_sd = false;
+    }
+    free(file_read_buf);
+    vTaskDelete(NULL);
+}
+
+void video_receiver_task(void *pvParameters) {
     int rcv_buf_size = 65536;
     struct timeval timeout = { .tv_sec = 1, .tv_usec = 0 };
     TickType_t last_sync_time = xTaskGetTickCount();
@@ -769,6 +1320,12 @@ void udp_receiver_task(void *pvParameters) {
     uint8_t read_buf[2048]; // 用於接收 UDP 封包 (通常 FFmpeg 每個 UDP 包含 7 個 TS 包，即 1316 Bytes)
 
     while (1) {
+        if (g_is_playing_from_sd) {
+            // SD card playback is active, pause network reception.
+            vTaskDelay(pdMS_TO_TICKS(500));
+            continue;
+        }
+
         xEventGroupWaitBits(s_wifi_event_group, WIFI_CONNECTED_BIT, pdFALSE, pdTRUE, portMAX_DELAY);
         // 改為 AF_INET6
         int sock = socket(AF_INET6, SOCK_DGRAM, IPPROTO_IP);
@@ -820,6 +1377,25 @@ void udp_receiver_task(void *pvParameters) {
                         if (esp_wifi_scan_start(&scan_config, false) == ESP_OK) last_scan_time = now_tick;
                     }
                 } else { g_async_wifi_rssi = 0; g_async_wifi_bssid[0] = '\0'; }
+
+                if (adc1_handle) {
+                    int adc_raw = 0;
+                    if (adc_oneshot_read(adc1_handle, ADC_CHANNEL_8, &adc_raw) == ESP_OK) {
+                        int voltage_mv = 0;
+                        if (do_calibration) {
+                            adc_cali_raw_to_voltage(adc1_cali_handle, adc_raw, &voltage_mv);
+                        } else {
+                            voltage_mv = adc_raw;
+                        }
+                        // 假设开发板上的电池分压电阻为 100k : 100k，即 1:2 分压。如果你的板子没有分压（直连），请去掉 "* 2"
+                        int real_mv = voltage_mv * 2;
+                        g_battery_voltage_mv = real_mv;
+                        int pct = (real_mv - 3300) * 100 / (4200 - 3300);
+                        if (pct > 100) pct = 100;
+                        if (pct < 0) pct = 0;
+                        g_battery_percentage = pct;
+                    }
+                }
                 g_current_rx_speed_kbps = g_rx_bytes_1s / 1024; g_rx_bytes_1s = 0; last_sync_time = now_tick;
             }
 
@@ -1079,10 +1655,15 @@ static esp_err_t api_data_handler(httpd_req_t *req)
         if (wifi_cfg.sta.ssid[0] != '\0')
             strncpy(current_ssid, (char *)wifi_cfg.sta.ssid, sizeof(current_ssid) - 1);
     }
-    char json_resp[600];
+    char json_resp[1100]; // Reverted from 1200
+    uint64_t sd_total = 0, sd_free = 0;
+    if (g_sd_card_mounted) {
+        esp_vfs_fat_info(MOUNT_POINT, &sd_total, &sd_free);
+    }
+
     snprintf(json_resp, sizeof(json_resp),
-             "{\"ssid\":\"%s\",\"rssi\":%d,\"fps\":%d,\"brightness\":%ld,\"osd\":%d,\"time_osd\":%d,\"user\":\"%s\",\"ip\":\"%s\",\"ip6\":\"%s\",\"timezone\":\"%s\",\"udp_port\":%ld}",
-             current_ssid, g_current_rssi, g_current_fps, g_current_brightness, g_show_osd, g_show_time_osd, g_admin_user, g_device_ip, g_device_ip6, g_timezone, g_udp_port);
+             "{\"ssid\":\"%s\",\"rssi\":%d,\"fps\":%d,\"brightness\":%ld,\"volume\":%ld,\"osd\":%d,\"time_osd\":%d,\"user\":\"%s\",\"ip\":\"%s\",\"ip6\":\"%s\",\"timezone\":\"%s\",\"udp_port\":%ld,\"rgb_r\":%d,\"rgb_g\":%d,\"rgb_b\":%d,\"sd_mounted\":%d,\"sd_playing\":%d,\"sd_total_mb\":%lu,\"sd_free_mb\":%lu,\"audio\":%d,\"bat_mv\":%d,\"bat_pct\":%d}",
+             current_ssid, g_current_rssi, g_current_fps, g_current_brightness, g_current_volume, g_show_osd, g_show_time_osd, g_admin_user, g_device_ip, g_device_ip6, g_timezone, g_udp_port, g_rgb_r, g_rgb_g, g_rgb_b, g_sd_card_mounted, g_is_playing_from_sd, (unsigned long)(sd_total / 1048576), (unsigned long)(sd_free / 1048576), g_audio_enable, g_battery_voltage_mv, g_battery_percentage);
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, json_resp, HTTPD_RESP_USE_STRLEN);
     return ESP_OK;
@@ -1103,6 +1684,12 @@ static esp_err_t api_set_handler(httpd_req_t *req)
     if (httpd_req_get_url_query_str(req, buf, sizeof(buf)) == ESP_OK)
     {
         char param[64];
+        char save_str[8] = {0};
+        int save = 1; // 默认保存，兼容老调用
+        if (httpd_query_key_value(buf, "save", save_str, sizeof(save_str)) == ESP_OK) {
+            save = atoi(save_str);
+        }
+
         if (httpd_query_key_value(buf, "brightness", param, sizeof(param)) == ESP_OK)
         {
             int32_t br = atoi(param);
@@ -1111,9 +1698,23 @@ static esp_err_t api_set_handler(httpd_req_t *req)
             if (br > 100)
                 br = 100;
             g_current_brightness = br;
-            save_int_to_nvs("brightness", br);
+            if (save) {
+                save_int_to_nvs("brightness", br);
+            }
             ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, (br * 255) / 100);
             ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
+        }
+        if (httpd_query_key_value(buf, "volume", param, sizeof(param)) == ESP_OK)
+        {
+            int32_t vol = atoi(param);
+            if (vol < 0) vol = 0;
+            if (vol > 100) vol = 100;
+            g_current_volume = vol;
+            if (save) {
+                save_int_to_nvs("volume", vol);
+            }
+            uint8_t vol_reg = vol == 0 ? 0 : ((vol * 256 / 100) - 1);
+            es8311_write_reg(0x32, vol_reg);
         }
         if (httpd_query_key_value(buf, "osd", param, sizeof(param)) == ESP_OK)
         {
@@ -1124,6 +1725,14 @@ static esp_err_t api_set_handler(httpd_req_t *req)
         {
             g_show_time_osd = (atoi(param) == 1) ? 1 : 0;
             save_i8_to_nvs("show_time", g_show_time_osd);
+        }
+        if (httpd_query_key_value(buf, "audio", param, sizeof(param)) == ESP_OK)
+        {
+            g_audio_enable = (atoi(param) == 1) ? 1 : 0;
+            if (save) {
+                save_i8_to_nvs("audio_enable", g_audio_enable);
+            }
+            gpio_set_level(PA_EN_PIN, g_audio_enable ? 0 : 1);
         }
         if (httpd_query_key_value(buf, "timezone", param, sizeof(param)) == ESP_OK)
         {
@@ -1156,6 +1765,47 @@ static esp_err_t api_set_handler(httpd_req_t *req)
         return ESP_OK;
     }
 
+    httpd_resp_send(req, "OK", HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+static esp_err_t api_rgb_handler(httpd_req_t *req)
+{
+    if (!is_authenticated(req))
+    {
+        httpd_resp_set_status(req, "401 Unauthorized");
+        httpd_resp_send(req, "Unauthorized", HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
+
+    char buf[128];
+    if (httpd_req_get_url_query_str(req, buf, sizeof(buf)) == ESP_OK)
+    {
+        char r_str[8] = {0}, g_str[8] = {0}, b_str[8] = {0}, save_str[8] = {0};
+        if (httpd_query_key_value(buf, "r", r_str, sizeof(r_str)) == ESP_OK &&
+            httpd_query_key_value(buf, "g", g_str, sizeof(g_str)) == ESP_OK &&
+            httpd_query_key_value(buf, "b", b_str, sizeof(b_str)) == ESP_OK)
+        {
+            int save = 1; // 默认保存，兼容老调用
+            if (httpd_query_key_value(buf, "save", save_str, sizeof(save_str)) == ESP_OK) {
+                save = atoi(save_str);
+            }
+
+            if (s_led_strip) {
+                g_rgb_r = atoi(r_str);
+                g_rgb_g = atoi(g_str);
+                g_rgb_b = atoi(b_str);
+                led_strip_set_pixel(s_led_strip, 0, g_rgb_r, g_rgb_g, g_rgb_b);
+                led_strip_refresh(s_led_strip);
+                
+                if (save) {
+                    save_u8_to_nvs("rgb_r", g_rgb_r);
+                    save_u8_to_nvs("rgb_g", g_rgb_g);
+                    save_u8_to_nvs("rgb_b", g_rgb_b);
+                }
+            }
+        }
+    }
     httpd_resp_send(req, "OK", HTTPD_RESP_USE_STRLEN);
     return ESP_OK;
 }
@@ -1200,11 +1850,325 @@ static esp_err_t api_wifi_reset_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+static esp_err_t api_sd_format_handler(httpd_req_t *req)
+{
+    if (!is_authenticated(req))
+    {
+        httpd_resp_set_status(req, "401 Unauthorized");
+        httpd_resp_send(req, "Unauthorized", HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
+    if (!g_sd_card_mounted) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_send(req, "SD Card not mounted", HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
+
+    if (esp_vfs_fat_sdcard_format(MOUNT_POINT, s_card) == ESP_OK) {
+        httpd_resp_send(req, "OK", HTTPD_RESP_USE_STRLEN);
+    } else {
+        ESP_LOGE("SD", "Format failed, unmounting card.");
+        esp_vfs_fat_sdcard_unmount(MOUNT_POINT, s_card);
+        g_sd_card_mounted = false;
+        httpd_resp_set_status(req, "500 Internal Server Error");
+        httpd_resp_send(req, "Format failed", HTTPD_RESP_USE_STRLEN);
+    }
+    return ESP_OK;
+}
+
+static esp_err_t api_sd_play_handler(httpd_req_t *req)
+{
+    if (!is_authenticated(req)) {
+        httpd_resp_set_status(req, "401 Unauthorized");
+        return httpd_resp_send(req, "Unauthorized", HTTPD_RESP_USE_STRLEN);
+    }
+    if (g_is_playing_from_sd) {
+        httpd_resp_set_status(req, "409 Conflict");
+        return httpd_resp_send(req, "Already playing a file.", HTTPD_RESP_USE_STRLEN);
+    }
+
+    char buf[200];
+    if (httpd_req_get_url_query_str(req, buf, sizeof(buf)) == ESP_OK) {
+        char file_param[128];
+        if (httpd_query_key_value(buf, "file", file_param, sizeof(file_param)) == ESP_OK) {
+            url_decode_safe(s_playback_filename, file_param, sizeof(s_playback_filename));
+            if (strchr(s_playback_filename, '/') != NULL || strchr(s_playback_filename, '\\') != NULL) {
+                httpd_resp_set_status(req, "400 Bad Request");
+                return httpd_resp_send(req, "Invalid filename", HTTPD_RESP_USE_STRLEN);
+            }
+            xTaskNotifyGive(s_sd_playback_task_handle);
+            return httpd_resp_send(req, "OK", HTTPD_RESP_USE_STRLEN);
+        }
+    }
+    httpd_resp_set_status(req, "400 Bad Request");
+    return httpd_resp_send(req, "File parameter missing", HTTPD_RESP_USE_STRLEN);
+}
+
+static esp_err_t api_sd_stop_handler(httpd_req_t *req)
+{
+    if (!is_authenticated(req)) {
+        httpd_resp_set_status(req, "401 Unauthorized");
+        return httpd_resp_send(req, "Unauthorized", HTTPD_RESP_USE_STRLEN);
+    }
+    if (g_is_playing_from_sd) {
+        g_stop_playback = true;
+        // Wait a moment for the task to acknowledge the stop signal
+        for (int i = 0; i < 10 && g_is_playing_from_sd; i++) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+        }
+    }
+    httpd_resp_send(req, "OK", HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+
+static esp_err_t api_sd_delete_handler(httpd_req_t *req)
+{
+    if (!is_authenticated(req))
+    {
+        httpd_resp_set_status(req, "401 Unauthorized");
+        httpd_resp_send(req, "Unauthorized", HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
+    if (!g_sd_card_mounted) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_send(req, "SD Card not mounted", HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
+
+    char buf[128];
+    if (httpd_req_get_url_query_str(req, buf, sizeof(buf)) == ESP_OK) {
+        char file_param[64];
+        if (httpd_query_key_value(buf, "file", file_param, sizeof(file_param)) == ESP_OK) {
+            char decoded_file[64];
+            url_decode_safe(decoded_file, file_param, sizeof(decoded_file));
+            
+            // 防止跨目录攻击
+            if (strchr(decoded_file, '/') != NULL || strchr(decoded_file, '\\') != NULL) {
+                httpd_resp_set_status(req, "400 Bad Request");
+                httpd_resp_send(req, "Invalid filename", HTTPD_RESP_USE_STRLEN);
+                return ESP_OK;
+            }
+
+            char filepath[128];
+            snprintf(filepath, sizeof(filepath), "%s/%s", MOUNT_POINT, decoded_file);
+            
+            if (unlink(filepath) == 0) {
+                return httpd_resp_send(req, "OK", HTTPD_RESP_USE_STRLEN);
+            } else {
+                ESP_LOGE("SD", "Failed to delete file %s", filepath);
+                // Check if the card is still there.
+                uint64_t total, free;
+                if (esp_vfs_fat_info(MOUNT_POINT, &total, &free) != ESP_OK) {
+                    ESP_LOGE("SD", "Card inaccessible after delete failure. Unmounting.");
+                    esp_vfs_fat_sdcard_unmount(MOUNT_POINT, s_card);
+                    g_sd_card_mounted = false;
+                }
+            }
+        }
+    }
+    
+    httpd_resp_set_status(req, "500 Internal Server Error");
+    httpd_resp_send(req, "Delete failed", HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+static esp_err_t api_sd_eject_handler(httpd_req_t *req)
+{
+    if (!is_authenticated(req))
+    {
+        httpd_resp_set_status(req, "401 Unauthorized");
+        httpd_resp_send(req, "Unauthorized", HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
+    if (!g_sd_card_mounted) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_send(req, "SD Card not mounted", HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
+
+    // If playing, stop it first
+    if (g_is_playing_from_sd)
+        g_stop_playback = true;
+
+    if (esp_vfs_fat_sdcard_unmount(MOUNT_POINT, s_card) == ESP_OK) {
+        g_sd_card_mounted = false;
+        return httpd_resp_send(req, "OK", HTTPD_RESP_USE_STRLEN);
+    }
+    
+    httpd_resp_set_status(req, "500 Internal Server Error");
+    return httpd_resp_send(req, "Eject failed", HTTPD_RESP_USE_STRLEN);
+}
+
+static esp_err_t api_files_handler(httpd_req_t *req)
+{
+    if (!is_authenticated(req))
+    {
+        httpd_resp_set_status(req, "401 Unauthorized");
+        httpd_resp_send(req, "Unauthorized", HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
+    // Try to ensure the card is mounted before proceeding.
+    sd_card_init();
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send_chunk(req, "[", 1);
+
+    DIR *dir = opendir(MOUNT_POINT);
+    if (dir)
+    {
+        struct dirent *entry;
+        bool first = true;
+        char buf[512];
+        while ((entry = readdir(dir)) != NULL)
+        {
+            if (entry->d_type == DT_REG)
+            {
+                char filepath[300];
+                snprintf(filepath, sizeof(filepath), "%s/%s", MOUNT_POINT, entry->d_name);
+                struct stat st;
+                if (stat(filepath, &st) == 0)
+                {
+                    snprintf(buf, sizeof(buf), "%s{\"name\":\"%s\",\"size\":%ld}",
+                             first ? "" : ",", entry->d_name, (long)st.st_size);
+                    httpd_resp_send_chunk(req, buf, strlen(buf));
+                    first = false;
+                }
+            }
+        }
+        closedir(dir);
+    }
+    httpd_resp_send_chunk(req, "]", 1);
+    httpd_resp_send_chunk(req, NULL, 0);
+    return ESP_OK;
+}
+
+static esp_err_t api_sd_upload_handler(httpd_req_t *req)
+{
+    if (!is_authenticated(req))
+    {
+        httpd_resp_set_status(req, "401 Unauthorized");
+        httpd_resp_send(req, "Unauthorized", HTTPD_RESP_USE_STRLEN);
+        return ESP_FAIL;
+    }
+    if (!g_sd_card_mounted) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_send(req, "SD Card not mounted", HTTPD_RESP_USE_STRLEN);
+        return ESP_FAIL;
+    }
+
+    char buf[128];
+    char file_param[64] = {0};
+    if (httpd_req_get_url_query_str(req, buf, sizeof(buf)) == ESP_OK) {
+        httpd_query_key_value(buf, "file", file_param, sizeof(file_param));
+    }
+
+    if (strlen(file_param) == 0) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_send(req, "Filename missing", HTTPD_RESP_USE_STRLEN);
+        return ESP_FAIL;
+    }
+
+    char decoded_file[64];
+    url_decode_safe(decoded_file, file_param, sizeof(decoded_file));
+    if (strchr(decoded_file, '/') != NULL || strchr(decoded_file, '\\') != NULL) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_send(req, "Invalid filename", HTTPD_RESP_USE_STRLEN);
+        return ESP_FAIL;
+    }
+
+    char filepath[128];
+    snprintf(filepath, sizeof(filepath), "%s/%s", MOUNT_POINT, decoded_file);
+
+    FILE *f = fopen(filepath, "wb");
+    if (!f) {
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+
+    char *data_buf = malloc(4096);
+    if (!data_buf) {
+        fclose(f);
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+
+    int remaining = req->content_len;
+    esp_err_t err = ESP_OK;
+
+    while (remaining > 0) {
+        int received = httpd_req_recv(req, data_buf, MIN(remaining, 4096));
+        if (received <= 0) {
+            err = ESP_FAIL;
+            break;
+        }
+        if (fwrite(data_buf, 1, received, f) != received) {
+            err = ESP_FAIL;
+            break;
+        }
+        remaining -= received;
+    }
+
+    free(data_buf);
+    fclose(f);
+
+    if (err != ESP_OK) {
+        unlink(filepath); // 删除不完整的文件
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+
+    httpd_resp_send(req, "OK", HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+static esp_err_t sd_file_download_handler(httpd_req_t *req)
+{
+    if (!is_authenticated(req)) {
+        httpd_resp_set_status(req, "401 Unauthorized");
+        httpd_resp_send(req, "Unauthorized", HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
+    char filepath[128];
+    strlcpy(filepath, req->uri, sizeof(filepath));
+    
+    // 移除 URL 可能附带的 Query Params
+    char *q = strchr(filepath, '?');
+    if (q) *q = '\0';
+
+    FILE *f = fopen(filepath, "r");
+    if (!f) return httpd_resp_send_404(req);
+
+    httpd_resp_set_type(req, "video/x-motion-jpeg");
+    
+    char *chunk = malloc(8192);
+    if (!chunk) {
+        fclose(f);
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+    size_t read_bytes;
+    while ((read_bytes = fread(chunk, 1, 8192, f)) > 0) {
+        if (httpd_resp_send_chunk(req, chunk, read_bytes) != ESP_OK) {
+            fclose(f);
+            free(chunk);
+            return ESP_FAIL;
+        }
+    }
+    fclose(f);
+    free(chunk);
+    httpd_resp_send_chunk(req, NULL, 0);
+    return ESP_OK;
+}
+
 static httpd_handle_t start_webserver(void)
 {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = 80;
-    config.max_uri_handlers = 16;
+    config.max_uri_handlers = 19;
+    config.max_open_sockets = 3; // 限制普通接口服务器的并发连接数
+    config.lru_purge_enable = true; // 自动踢掉老旧闲置连接，保护可用 Socket
+    config.uri_match_fn = httpd_uri_match_wildcard; // 开启通配符路由匹配
     httpd_handle_t server = NULL;
     if (httpd_start(&server, &config) == ESP_OK)
     {
@@ -1218,15 +2182,34 @@ static httpd_handle_t start_webserver(void)
         httpd_register_uri_handler(server, &api_data_uri);
         httpd_uri_t api_set_uri = {.uri = "/api/set", .method = HTTP_GET, .handler = api_set_handler, .user_ctx = NULL};
         httpd_register_uri_handler(server, &api_set_uri);
+        httpd_uri_t api_rgb_uri = {.uri = "/api/rgb", .method = HTTP_GET, .handler = api_rgb_handler, .user_ctx = NULL};
+        httpd_register_uri_handler(server, &api_rgb_uri);
         httpd_uri_t api_acc_uri = {.uri = "/api/account", .method = HTTP_GET, .handler = api_account_handler, .user_ctx = NULL};
         httpd_register_uri_handler(server, &api_acc_uri);
         httpd_uri_t api_wifi_reset_uri = {.uri = "/api/wifi_reset", .method = HTTP_POST, .handler = api_wifi_reset_handler, .user_ctx = NULL};
         httpd_register_uri_handler(server, &api_wifi_reset_uri);
         httpd_uri_t ota_uri = {.uri = "/api/ota", .method = HTTP_POST, .handler = api_ota_handler, .user_ctx = NULL};
         httpd_register_uri_handler(server, &ota_uri);
+        httpd_uri_t sd_format_uri = {.uri = "/api/sd_format", .method = HTTP_POST, .handler = api_sd_format_handler, .user_ctx = NULL};
+        httpd_register_uri_handler(server, &sd_format_uri);
         httpd_uri_t do_restart_uri = {.uri = "/api/restart", .method = HTTP_POST, .handler = do_restart_handler, .user_ctx = NULL};
         httpd_register_uri_handler(server, &do_restart_uri);
+        httpd_uri_t api_files_uri = {.uri = "/api/files", .method = HTTP_GET, .handler = api_files_handler, .user_ctx = NULL};
+        httpd_register_uri_handler(server, &api_files_uri);
+        httpd_uri_t api_sd_delete_uri = {.uri = "/api/sd_delete", .method = HTTP_POST, .handler = api_sd_delete_handler, .user_ctx = NULL};
+        httpd_register_uri_handler(server, &api_sd_delete_uri);
+        httpd_uri_t sd_eject_uri = {.uri = "/api/sd_eject", .method = HTTP_POST, .handler = api_sd_eject_handler, .user_ctx = NULL};
+        httpd_register_uri_handler(server, &sd_eject_uri);
+        httpd_uri_t sd_play_uri = {.uri = "/api/sd_play", .method = HTTP_POST, .handler = api_sd_play_handler, .user_ctx = NULL};
+        httpd_register_uri_handler(server, &sd_play_uri);
+        httpd_uri_t sd_stop_uri = {.uri = "/api/sd_stop", .method = HTTP_POST, .handler = api_sd_stop_handler, .user_ctx = NULL};
+        httpd_register_uri_handler(server, &sd_stop_uri);
+        httpd_uri_t api_sd_upload_uri = {.uri = "/api/sd_upload", .method = HTTP_POST, .handler = api_sd_upload_handler, .user_ctx = NULL};
+        httpd_register_uri_handler(server, &api_sd_upload_uri);
+        httpd_uri_t sd_file_uri = {.uri = "/sdcard/*", .method = HTTP_GET, .handler = sd_file_download_handler, .user_ctx = NULL};
+        httpd_register_uri_handler(server, &sd_file_uri);
     }
+
     return server;
 }
 
@@ -1322,6 +2305,10 @@ void app_main(void)
     ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, ESP_EVENT_ANY_ID, &sys_event_handler, NULL));
 
     lcd_hardware_init();
+    sd_card_init();
+    audio_hardware_init();
+    battery_adc_init();
+    rgb_led_init();
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
 
@@ -1332,6 +2319,7 @@ void app_main(void)
     ESP_ERROR_CHECK(network_prov_mgr_is_wifi_provisioned(&provisioned));
 
     xTaskCreatePinnedToCore(jpeg_decode_display_task, "jpeg_task", 8192, NULL, 5, NULL, 1);
+    xTaskCreatePinnedToCore(sd_playback_task, "sd_playback", 8192, NULL, 6, &s_sd_playback_task_handle, 0);
 
     if (!provisioned)
     {
@@ -1351,6 +2339,47 @@ void app_main(void)
     ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
     init_time_sync();
 
-    xTaskCreatePinnedToCore(udp_receiver_task, "udp_task", 8192, NULL, 8, NULL, 0);
+    xTaskCreatePinnedToCore(audio_receiver_task, "audio_task", 4096, NULL, 9, NULL, 0); // 提升音频任务优先级至 9，防止被视频 UDP (8) 抢占导致 I2S 饥饿
+    xTaskCreatePinnedToCore(video_receiver_task, "video_task", 8192, NULL, 8, NULL, 0);
     start_webserver();
+
+    TickType_t last_scan_time = 0;
+    while (1) {
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        
+        // 定期系统状态监控 (从 video_receiver_task 迁移至此，避免阻塞网络接收)
+        g_async_free_heap_kb = esp_get_free_heap_size() / 1024;
+        wifi_ap_record_t ap_info;
+        if (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK) {
+            g_async_wifi_rssi = ap_info.rssi;
+            snprintf((char *)g_async_wifi_bssid, sizeof(g_async_wifi_bssid), "%02X:%02X:%02X:%02X:%02X:%02X",
+                     ap_info.bssid[0], ap_info.bssid[1], ap_info.bssid[2], ap_info.bssid[3], ap_info.bssid[4], ap_info.bssid[5]);
+            
+            TickType_t now_tick = xTaskGetTickCount();
+            if (ap_info.rssi < -60 && now_tick - last_scan_time >= pdMS_TO_TICKS(10000)) {
+                wifi_scan_config_t scan_config = {0}; scan_config.ssid = ap_info.ssid;
+                if (esp_wifi_scan_start(&scan_config, false) == ESP_OK) last_scan_time = now_tick;
+            }
+        } else { g_async_wifi_rssi = 0; g_async_wifi_bssid[0] = '\0'; }
+
+        if (adc1_handle) {
+            int adc_raw = 0;
+            if (adc_oneshot_read(adc1_handle, ADC_CHANNEL_8, &adc_raw) == ESP_OK) {
+                int voltage_mv = 0;
+                if (do_calibration) {
+                    adc_cali_raw_to_voltage(adc1_cali_handle, adc_raw, &voltage_mv);
+                } else {
+                    voltage_mv = adc_raw;
+                }
+                int real_mv = voltage_mv * 2;
+                g_battery_voltage_mv = real_mv;
+                int pct = (real_mv - 3300) * 100 / (4200 - 3300);
+                if (pct > 100) pct = 100;
+                if (pct < 0) pct = 0;
+                g_battery_percentage = pct;
+            }
+        }
+        g_current_rx_speed_kbps = g_rx_bytes_1s / 1024; 
+        g_rx_bytes_1s = 0;
+    }
 }

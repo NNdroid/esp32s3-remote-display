@@ -34,7 +34,7 @@ dependencies:
       type: service
     version: 2.0.2
   espressif/esp_new_jpeg:
-    component_hash: 98823384f51ca298e2c9bebacd1c629148e528ed0902d18b16556df151519e68
+    component_hash: e1e7e6991193c41ed6c9fc386702aa7821433319e7aa9c3147cd3236310cd69c
     dependencies: []
     source:
       registry_url: https://components.espressif.com/
@@ -51,7 +51,17 @@ dependencies:
     - esp32c6
     - esp32c61
     - esp32h4
-    version: 1.0.1
+    version: 1.0.2
+  espressif/led_strip:
+    component_hash: 28621486f77229aaf81c71f5e15d6fbf36c2949cf11094e07090593e659e7639
+    dependencies:
+    - name: idf
+      require: private
+      version: '>=5.0'
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 3.0.3
   espressif/network_provisioning:
     component_hash: 72d27784e3daf807418a34fb00be136ec50c6db49d989ce981d22e031fc0e7f8
     dependencies:
@@ -75,8 +85,9 @@ dependencies:
 direct_dependencies:
 - espressif/esp_lcd_ili9341
 - espressif/esp_new_jpeg
+- espressif/led_strip
 - espressif/network_provisioning
 - idf
-manifest_hash: f78d92e9b2fd8850cc014afa5264b23030834ac1cfca8ff21ad8364e1fdba92a
+manifest_hash: 83225143266408b0f62dc785e1f289eafa62c11090a8b2206c811905283e8f34
 target: esp32s3
 version: 3.0.0
