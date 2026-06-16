@@ -7,32 +7,32 @@
     <style>
         :root {
             /* ☀️ Daylight Mode Variables */
-            --glass-bg: rgba(255, 255, 255, 0.4);
-            --glass-border: rgba(0, 0, 0, 0.08);
-            --glass-blur: blur(20px);
+            --glass-bg: rgba(255, 255, 255, 0.5);
+            --glass-border: rgba(255, 255, 255, 0.6);
+            --glass-blur: blur(30px) saturate(180%);
             --accent: #007AFF;
             --text-main: #1d1d1f;
-            --input-bg: rgba(255, 255, 255, 0.65);
+            --input-bg: rgba(255, 255, 255, 0.7);
             --input-border: rgba(0, 0, 0, 0.12);
             --input-text: #000000;
             --input-placeholder: rgba(0, 0, 0, 0.35);
-            --bg-gradient: linear-gradient(-45deg, #e4e8f0, #f5f7fa, #e0e5ec, #f0f4f8);
-            --box-shadow: 0 15px 35px rgba(0, 0, 0, 0.06);
+            --bg-gradient: linear-gradient(-45deg, #ff9a9e, #fecfef, #a1c4fd, #c2e9fb);
+            --box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.1);
         }
         
         @media (prefers-color-scheme: dark) {
             :root {
                 /* 🌙 Night Mode Variables */
-                --glass-bg: rgba(30, 30, 30, 0.45);
-                --glass-border: rgba(255, 255, 255, 0.1);
+                --glass-bg: rgba(30, 30, 30, 0.55);
+                --glass-border: rgba(255, 255, 255, 0.15);
                 --accent: #0A84FF;
                 --text-main: #ffffff;
-                --input-bg: rgba(0, 0, 0, 0.25);
+                --input-bg: rgba(0, 0, 0, 0.35);
                 --input-border: rgba(255, 255, 255, 0.15);
                 --input-text: #ffffff;
                 --input-placeholder: rgba(255, 255, 255, 0.4);
-                --bg-gradient: linear-gradient(-45deg, #0f172a, #1e1b4b, #000000, #020617);
-                --box-shadow: 0 15px 35px rgba(0, 0, 0, 0.5);
+                --bg-gradient: linear-gradient(-45deg, #1a1a2e, #16213e, #0f3460, #e94560);
+                --box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.4);
             }
         }
         
@@ -45,7 +45,7 @@
             font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
             background: var(--bg-gradient);
             background-size: 400% 400%;
-            animation: gradientBG 15s ease infinite;
+            animation: gradientBG 20s ease infinite;
             color: var(--text-main);
             transition: color 0.4s ease, background 0.4s ease;
         }
@@ -61,8 +61,8 @@
             backdrop-filter: var(--glass-blur);
             -webkit-backdrop-filter: var(--glass-blur);
             border: 1px solid var(--glass-border);
-            padding: 40px 30px;
-            border-radius: 20px;
+            padding: 45px 30px;
+            border-radius: 28px;
             box-shadow: var(--box-shadow);
             text-align: center;
             width: 90%;
@@ -72,46 +72,49 @@
 
         h2 {
             margin-top: 0;
-            margin-bottom: 25px;
-            font-weight: 500;
+            margin-bottom: 30px;
+            font-weight: 600;
             letter-spacing: 0.5px;
         }
 
         input {
             width: 100%;
             box-sizing: border-box;
-            padding: 14px 16px;
-            margin-bottom: 15px;
-            border-radius: 12px;
+            padding: 16px 20px;
+            margin-bottom: 18px;
+            border-radius: 16px;
             border: 1px solid var(--input-border);
             background: var(--input-bg);
             color: var(--input-text);
             font-size: 16px;
             outline: none;
             transition: all 0.3s ease;
+            box-shadow: inset 0 2px 4px rgba(0, 0, 0, 0.05);
         }
 
         input::placeholder { color: var(--input-placeholder); }
         input:focus {
             border-color: var(--accent);
-            box-shadow: 0 0 0 3px rgba(10, 132, 255, 0.2);
+            box-shadow: inset 0 2px 4px rgba(0, 0, 0, 0.05), 0 0 0 3px rgba(10, 132, 255, 0.3);
         }
 
         button {
             width: 100%;
-            padding: 14px;
+            padding: 16px;
             background: var(--accent);
             color: #fff;
             font-size: 16px;
             font-weight: 600;
             border: none;
-            border-radius: 12px;
+            border-radius: 16px;
             cursor: pointer;
-            transition: transform 0.1s, opacity 0.2s;
-            margin-top: 10px;
+            transition: transform 0.1s, opacity 0.2s, box-shadow 0.3s;
+            margin-top: 15px;
+            box-shadow: 0 4px 12px rgba(0, 122, 255, 0.3);
         }
 
         button:active { transform: scale(0.96); opacity: 0.9; }
+        button:hover { opacity: 0.9; box-shadow: 0 6px 16px rgba(0, 122, 255, 0.4); }
 
         .footer {
             position: absolute;
@@ -164,7 +167,7 @@
 </head>
 <body>
     <div class="glass-box">
-        <h2>🔒 Wireless Display Console</h2>
+        <h2>🔒 Console Login</h2>
         <form action="/do_login" method="GET">
             <input type="text" name="user" placeholder="Username" required autocomplete="username" />
             <input type="password" name="pwd" placeholder="Password" required autocomplete="current-password" />

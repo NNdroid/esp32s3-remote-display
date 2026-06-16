@@ -128,6 +128,11 @@ volatile bool g_is_provisioning = false;
 volatile bool g_sd_card_mounted = false;
 volatile bool g_is_playing_from_sd = false;
 volatile bool g_stop_playback = false;
+volatile bool g_pause_playback = false;
+
+volatile uint32_t g_sd_file_size = 0;
+volatile uint32_t g_sd_current_pos = 0;
+volatile int g_seek_permille = -1; // 用千分比来做细粒度的精度控制 (0~1000)
 
 volatile uint8_t g_rgb_r = 0, g_rgb_g = 0, g_rgb_b = 0;
 char g_syslog_host[64] = "";
@@ -1167,17 +1172,19 @@ void sd_playback_task(void *pvParameters)
     uint32_t current_frame_len = 0;
     bool frame_corrupted = true;
     int8_t last_video_cc = -1;
-    uint16_t video_pid = 0x1FFF;
+    uint16_t video_pid = 0x2000;
     int8_t last_audio_cc = -1;
-    uint16_t audio_pid = 0x1FFF;
+    uint16_t audio_pid = 0x2000;
 
     while (1) {
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY); // Wait for a play command
 
         g_is_playing_from_sd = true;
         g_stop_playback = false;
-        video_pid = 0x1FFF;
-        audio_pid = 0x1FFF;
+        g_pause_playback = false;
+        g_seek_permille = -1;
+        video_pid = 0x2000;
+        audio_pid = 0x2000;
         frame_corrupted = true;
         has_active_buffer = false;
 
@@ -1190,11 +1197,34 @@ void sd_playback_task(void *pvParameters)
             g_is_playing_from_sd = false;
             continue;
         }
+        
+        fseek(f, 0, SEEK_END);
+        g_sd_file_size = ftell(f);
+        fseek(f, 0, SEEK_SET);
+        g_sd_current_pos = 0;
+
         ESP_LOGI("PLAY", "Playing %s...", filepath);
 
         while (!g_stop_playback) {
+            if (g_seek_permille >= 0) {
+                uint32_t target_pos = (g_sd_file_size / 1000) * g_seek_permille;
+                target_pos = (target_pos / 188) * 188; // 强制 188 字节对齐，完美匹配 TS 格式包头
+                fseek(f, target_pos, SEEK_SET);
+                g_seek_permille = -1;
+                g_sd_current_pos = ftell(f);
+                frame_corrupted = true;
+                has_active_buffer = false;
+            }
+
+            if (g_pause_playback) {
+                vTaskDelay(pdMS_TO_TICKS(50));
+                continue;
+            }
+
             size_t bytes_read = fread(file_read_buf, 1, 188 * 64, f);
             if (bytes_read == 0) break; // End of file
+            
+            g_sd_current_pos = ftell(f);
 
             for (int offset = 0; offset <= (int)bytes_read - 188; offset += 188) {
                 if (g_stop_playback) break;
@@ -1218,7 +1248,7 @@ void sd_playback_task(void *pvParameters)
 
                 if (pusi) {
                     if (payload_len >= 6 && payload[0] == 0x00 && payload[1] == 0x00 && payload[2] == 0x01) {
-                        if (payload[3] == 0xE0) { // Video PES
+                        if ((payload[3] & 0xF0) == 0xE0) { // Video PES (0xE0 ~ 0xEF)
                             video_pid = pid;
                             int pes_header_len = 9 + payload[8];
                             if (payload_len > pes_header_len) {
@@ -1235,21 +1265,25 @@ void sd_playback_task(void *pvParameters)
                                     frame_corrupted = true;
                                 }
                             } else continue;
-                        } else if ((payload[3] & 0xF0) == 0xC0) { // Audio PES
-                            audio_pid = pid;
-                            last_audio_cc = cc;
-                            int pes_header_len = 9 + payload[8];
-                            if (payload_len > pes_header_len) {
-                                payload += pes_header_len;
-                                payload_len -= pes_header_len;
-                                if (g_audio_enable) {
+                        } else if ((payload[3] & 0xE0) == 0xC0 || payload[3] == 0xBD) { // Audio PES (0xC0~0xDF) 或 LPCM私有流 (0xBD)
+                            if (audio_pid == 0x2000 || audio_pid == pid) { // 锁定首个音频 PID
+                                audio_pid = pid;
+                                last_audio_cc = cc;
+                                if (payload_len > 8) { // 确保有足够长度读取 payload[8]
+                                    int pes_header_len = 9 + payload[8];
+                                    if (payload_len > pes_header_len) {
+                                        payload += pes_header_len;
+                                        payload_len -= pes_header_len;
+                                        if (g_audio_enable) {
 #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 0, 0)
-                                    size_t bytes_written = 0;
-                                    i2s_channel_write(tx_chan, payload, payload_len, &bytes_written, portMAX_DELAY);
+                                            size_t bytes_written = 0;
+                                            i2s_channel_write(tx_chan, payload, payload_len, &bytes_written, portMAX_DELAY);
 #else
-                                    size_t bytes_written = 0;
-                                    i2s_write(I2S_NUM_0, payload, payload_len, &bytes_written, portMAX_DELAY);
+                                            size_t bytes_written = 0;
+                                            i2s_write(I2S_NUM_0, payload, payload_len, &bytes_written, portMAX_DELAY);
 #endif
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -1286,7 +1320,8 @@ void sd_playback_task(void *pvParameters)
                     int expected_cc = (last_audio_cc + 1) & 0x0F;
                     if (cc != expected_cc) {
                         ESP_LOGW("PLAY", "Audio packet drop! Expected CC %d, got %d.", expected_cc, cc);
-                    } else if (g_audio_enable) {
+                    }
+                    if (g_audio_enable) {
 #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 0, 0)
                         size_t bytes_written = 0;
                         i2s_channel_write(tx_chan, payload, payload_len, &bytes_written, portMAX_DELAY);
@@ -1301,6 +1336,8 @@ void sd_playback_task(void *pvParameters)
         }
 
         fclose(f);
+        g_sd_file_size = 0;
+        g_sd_current_pos = 0;
         if (has_active_buffer) {
             xQueueSend(free_queue, &current_rx_frame, 0);
         }
@@ -1355,7 +1392,7 @@ void video_receiver_task(void *pvParameters) {
         bool has_active_buffer = false;
         
         // TS 解析狀態變數
-        uint16_t video_pid = 0x1FFF; // 初始無效 PID
+        uint16_t video_pid = 0x2000; // 初始無效 PID
         int8_t last_cc = -1;
         bool frame_corrupted = true; // 預設丟棄，直到看見新幀的起點
 
@@ -1655,15 +1692,15 @@ static esp_err_t api_data_handler(httpd_req_t *req)
         if (wifi_cfg.sta.ssid[0] != '\0')
             strncpy(current_ssid, (char *)wifi_cfg.sta.ssid, sizeof(current_ssid) - 1);
     }
-    char json_resp[1100]; // Reverted from 1200
+    char json_resp[1300]; // 扩展容量以容纳文件位置信息
     uint64_t sd_total = 0, sd_free = 0;
     if (g_sd_card_mounted) {
         esp_vfs_fat_info(MOUNT_POINT, &sd_total, &sd_free);
     }
 
     snprintf(json_resp, sizeof(json_resp),
-             "{\"ssid\":\"%s\",\"rssi\":%d,\"fps\":%d,\"brightness\":%ld,\"volume\":%ld,\"osd\":%d,\"time_osd\":%d,\"user\":\"%s\",\"ip\":\"%s\",\"ip6\":\"%s\",\"timezone\":\"%s\",\"udp_port\":%ld,\"rgb_r\":%d,\"rgb_g\":%d,\"rgb_b\":%d,\"sd_mounted\":%d,\"sd_playing\":%d,\"sd_total_mb\":%lu,\"sd_free_mb\":%lu,\"audio\":%d,\"bat_mv\":%d,\"bat_pct\":%d}",
-             current_ssid, g_current_rssi, g_current_fps, g_current_brightness, g_current_volume, g_show_osd, g_show_time_osd, g_admin_user, g_device_ip, g_device_ip6, g_timezone, g_udp_port, g_rgb_r, g_rgb_g, g_rgb_b, g_sd_card_mounted, g_is_playing_from_sd, (unsigned long)(sd_total / 1048576), (unsigned long)(sd_free / 1048576), g_audio_enable, g_battery_voltage_mv, g_battery_percentage);
+             "{\"ssid\":\"%s\",\"rssi\":%d,\"fps\":%d,\"brightness\":%ld,\"volume\":%ld,\"osd\":%d,\"time_osd\":%d,\"user\":\"%s\",\"ip\":\"%s\",\"ip6\":\"%s\",\"timezone\":\"%s\",\"udp_port\":%ld,\"rgb_r\":%d,\"rgb_g\":%d,\"rgb_b\":%d,\"sd_mounted\":%d,\"sd_playing\":%d,\"sd_total_mb\":%lu,\"sd_free_mb\":%lu,\"audio\":%d,\"bat_mv\":%d,\"bat_pct\":%d,\"sd_pos\":%lu,\"sd_size\":%lu,\"sd_file\":\"%s\"}",
+             current_ssid, g_current_rssi, g_current_fps, g_current_brightness, g_current_volume, g_show_osd, g_show_time_osd, g_admin_user, g_device_ip, g_device_ip6, g_timezone, g_udp_port, g_rgb_r, g_rgb_g, g_rgb_b, g_sd_card_mounted, g_is_playing_from_sd, (unsigned long)(sd_total / 1048576), (unsigned long)(sd_free / 1048576), g_audio_enable, g_battery_voltage_mv, g_battery_percentage, (unsigned long)g_sd_current_pos, (unsigned long)g_sd_file_size, s_playback_filename);
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, json_resp, HTTPD_RESP_USE_STRLEN);
     return ESP_OK;
@@ -1921,6 +1958,53 @@ static esp_err_t api_sd_stop_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+static esp_err_t api_sd_pause_handler(httpd_req_t *req)
+{
+    if (!is_authenticated(req)) {
+        httpd_resp_set_status(req, "401 Unauthorized");
+        return httpd_resp_send(req, "Unauthorized", HTTPD_RESP_USE_STRLEN);
+    }
+    if (g_is_playing_from_sd) {
+        g_pause_playback = true;
+    }
+    httpd_resp_send(req, "OK", HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+static esp_err_t api_sd_resume_handler(httpd_req_t *req)
+{
+    if (!is_authenticated(req)) {
+        httpd_resp_set_status(req, "401 Unauthorized");
+        return httpd_resp_send(req, "Unauthorized", HTTPD_RESP_USE_STRLEN);
+    }
+    if (g_is_playing_from_sd) {
+        g_pause_playback = false;
+    }
+    httpd_resp_send(req, "OK", HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+static esp_err_t api_sd_seek_handler(httpd_req_t *req)
+{
+    if (!is_authenticated(req)) {
+        httpd_resp_set_status(req, "401 Unauthorized");
+        return httpd_resp_send(req, "Unauthorized", HTTPD_RESP_USE_STRLEN);
+    }
+    if (!g_is_playing_from_sd) {
+        return httpd_resp_send(req, "OK", HTTPD_RESP_USE_STRLEN);
+    }
+    char buf[64];
+    if (httpd_req_get_url_query_str(req, buf, sizeof(buf)) == ESP_OK) {
+        char val_str[16];
+        if (httpd_query_key_value(buf, "val", val_str, sizeof(val_str)) == ESP_OK) {
+            int val = atoi(val_str);
+            if (val < 0) val = 0;
+            if (val > 1000) val = 1000;
+            g_seek_permille = val;
+        }
+    }
+    return httpd_resp_send(req, "OK", HTTPD_RESP_USE_STRLEN);
+}
 
 static esp_err_t api_sd_delete_handler(httpd_req_t *req)
 {
@@ -2165,7 +2249,7 @@ static httpd_handle_t start_webserver(void)
 {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = 80;
-    config.max_uri_handlers = 19;
+    config.max_uri_handlers = 26; // 增加处理路由数以支持 seek 接口
     config.max_open_sockets = 3; // 限制普通接口服务器的并发连接数
     config.lru_purge_enable = true; // 自动踢掉老旧闲置连接，保护可用 Socket
     config.uri_match_fn = httpd_uri_match_wildcard; // 开启通配符路由匹配
@@ -2204,6 +2288,12 @@ static httpd_handle_t start_webserver(void)
         httpd_register_uri_handler(server, &sd_play_uri);
         httpd_uri_t sd_stop_uri = {.uri = "/api/sd_stop", .method = HTTP_POST, .handler = api_sd_stop_handler, .user_ctx = NULL};
         httpd_register_uri_handler(server, &sd_stop_uri);
+        httpd_uri_t sd_pause_uri = {.uri = "/api/sd_pause", .method = HTTP_POST, .handler = api_sd_pause_handler, .user_ctx = NULL};
+        httpd_register_uri_handler(server, &sd_pause_uri);
+        httpd_uri_t sd_resume_uri = {.uri = "/api/sd_resume", .method = HTTP_POST, .handler = api_sd_resume_handler, .user_ctx = NULL};
+        httpd_register_uri_handler(server, &sd_resume_uri);
+        httpd_uri_t sd_seek_uri = {.uri = "/api/sd_seek", .method = HTTP_POST, .handler = api_sd_seek_handler, .user_ctx = NULL};
+        httpd_register_uri_handler(server, &sd_seek_uri);
         httpd_uri_t api_sd_upload_uri = {.uri = "/api/sd_upload", .method = HTTP_POST, .handler = api_sd_upload_handler, .user_ctx = NULL};
         httpd_register_uri_handler(server, &api_sd_upload_uri);
         httpd_uri_t sd_file_uri = {.uri = "/sdcard/*", .method = HTTP_GET, .handler = sd_file_download_handler, .user_ctx = NULL};
