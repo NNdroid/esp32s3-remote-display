@@ -176,7 +176,8 @@
     </div>
     <div class="footer">
         <p>
-            &copy; 2026 <a href="https://github.com/NNdroid">NNdroid</a>. All rights reserved.
+            &copy; 2026 <a href="https://github.com/NNdroid">NNdroid</a>. All rights reserved.<br>
+            Firmware Version: <span id="fw_ver" style="font-family: monospace;">---</span>
         </p>
     </div>
     <div id="toast" class="toast"></div>
@@ -192,6 +193,18 @@
             showToast("Invalid username or password!");
             window.history.replaceState({}, document.title, "/login");
         }
+
+        document.addEventListener("DOMContentLoaded", function() {
+            fetch('/api/version')
+                .then(response => response.json())
+                .then(data => {
+                    const verEl = document.getElementById("fw_ver");
+                    if (verEl && data.fw_ver) {
+                        verEl.innerText = data.fw_ver;
+                    }
+                })
+                .catch(err => console.log('Fetch version failed:', err));
+        });
     </script>
 </body>
 </html>

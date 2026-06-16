@@ -2,24 +2,38 @@
 
 ![esp32s3-lcd-board](docs/images/board.png)
 
-A lightweight and efficient remote display solution built on the **ES3C28P** (ESP32-S3) development board. This project allows you to stream video directly to the LCD screen using mpegts via FFmpeg. 
+A lightweight, efficient, and feature-rich remote display solution built on the **ES3C28P** (ESP32-S3) development board. This project allows you to stream real-time video and audio directly to the device over Wi-Fi, or play local media from an SD Card. 
 
-I personally use this project to cast live feeds from my security cameras onto a dedicated desktop monitor. It's perfect for creating a low-cost, low-latency smart home dashboard or a mini surveillance station.
+It features a modern **iOS Liquid Glass style Web Dashboard** for complete device management, making it perfect for creating a low-cost, low-latency smart home dashboard, a mini surveillance station, or a desktop media player.
 
 ## ✨ Key Features
-* **mpegts Video Streaming**: Decodes and displays real-time mpegts streams over UDP.
-* **Powered by ESP32-S3**: Utilizes the dual-core processor and PSRAM for smooth decoding and DMA-accelerated display updates.
-* **Simple Integration**: Easily push video streams from any source (Linux, Raspberry Pi, Windows) using standard FFmpeg commands.
-* **Low Latency**: Designed to minimize buffering for real-time monitoring applications.
+* **High-Performance Streaming**: Decodes and displays real-time MPEG-TS (MJPEG) video streams over UDP with hardware DMA acceleration.
+* **Audio Playback**: Built-in I2S audio decoding (ES8311) for synchronized sound and video.
+* **SD Card Media Player**: Upload, manage, and play local `.ts` video files directly from the Web Dashboard. Includes seek/progress bar support!
+* **Modern Web Dashboard**: A stunning iOS 26 "Liquid Glass" styled web interface to control brightness, volume, RGB LED, and network settings.
+* **System Monitoring**: Real-time charts for Wi-Fi RSSI, FPS, CPU load, and battery voltage.
+* **OTA Firmware Update**: Flash new firmware directly via the browser without connecting a USB cable.
+* **Secure Access**: Login authentication to protect your device console.
 
-## 🚀 How to Use (FFmpeg Example)
+## 🚀 Network Streaming (FFmpeg Example)
 
 You can easily cast your desktop, a video file, or an RTSP camera stream to the ESP32-S3 display.
 
-Here is an example of how to push an RTSP security camera stream to the device using FFmpeg:
+Our system uses a dual-port UDP approach (Video on `PORT`, Audio on `PORT+1`) for maximum performance. Here is an example of pushing an RTSP security camera stream:
 
 ```bash
-ffmpeg -rtsp_transport tcp -i "rtsp://YOUR_CAMERA_IP/stream" -vf "fps=20,scale=320:240" -an -c:v mjpeg -q:v 3 -pix_fmt yuvj420p -f mpegts "udp://YOUR_ESP32_IP:8888?pkt_size=1200&buffer_size=65535"
+ffmpeg -fflags nobuffer+discardcorrupt+genpts -max_delay 0 -flags low_delay -use_wallclock_as_timestamps 1 -probesize 50000 -analyzeduration 100000 -i "rtsp://YOUR_CAMERA_IP/stream" \
+  -an -vf "fps=25,scale=320:240" -c:v mjpeg -q:v 3 -pix_fmt yuvj420p -f mpegts "udp://YOUR_ESP32_IP:8888?pkt_size=1316" \
+  -vn -c:a pcm_s16le -ar 44100 -ac 2 -f s16le "udp://YOUR_ESP32_IP:8889?pkt_size=1024"
+```
+*(Note: Replace `YOUR_ESP32_IP` with the actual IP address shown on your display or dashboard.)*
+
+## 💾 SD Card Local Playback
+
+You can upload video files to the SD card via the Web Explorer. Before uploading, please convert your `mp4` or `mkv` videos to our supported `.ts` (MPEG-TS + MJPEG + PCM) format:
+
+```bash
+ffmpeg -i "your_source.mp4" -c:v mjpeg -q:v 2 -s 320x240 -c:a pcm_s16le -ar 44100 -ac 2 -f mpegts "your_source.ts"
 ```
 
 ## Demo
@@ -30,4 +44,3 @@ ffmpeg -rtsp_transport tcp -i "rtsp://YOUR_CAMERA_IP/stream" -vf "fps=20,scale=3
 ### Web
 
 ![web-screenshot-1](docs/images/web-screenshot-1.png)
-![web-screenshot-2](docs/images/web-screenshot-2.png)

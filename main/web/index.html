@@ -449,7 +449,8 @@
     
     <div class="footer">
         <p>
-            &copy; 2026 <a href="https://github.com/NNdroid">NNdroid</a>. All rights reserved.
+            &copy; 2026 <a href="https://github.com/NNdroid">NNdroid</a>. All rights reserved.<br>
+            Firmware Version: <span id="fw_ver" style="font-family: monospace;">---</span>
         </p>
     </div>
 
@@ -1109,6 +1110,10 @@
                     if (d.bat_pct < 20) batEl.style.color = "var(--danger)";
                     else if (d.bat_pct < 50) batEl.style.color = "var(--warning)";
                     else batEl.style.color = "var(--success)";
+                }
+                
+                if (d.fw_ver) {
+                    document.getElementById("fw_ver").innerText = d.fw_ver;
                 }
 
                 if (d.sd_playing) {

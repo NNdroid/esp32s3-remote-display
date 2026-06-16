@@ -25,6 +25,10 @@
 #include "esp_sntp.h"
 #include "esp_task_wdt.h"
 
+#ifndef PROJECT_VER
+#define PROJECT_VER "unknown"
+#endif
+
 // 空闲钩子组件头文件
 #include "esp_freertos_hooks.h"
 
@@ -1677,6 +1681,15 @@ static esp_err_t api_ota_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+static esp_err_t api_version_handler(httpd_req_t *req)
+{
+    char json_resp[128];
+    snprintf(json_resp, sizeof(json_resp), "{\"fw_ver\":\"%s\"}", PROJECT_VER);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, json_resp, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
 static esp_err_t api_data_handler(httpd_req_t *req)
 {
     if (!is_authenticated(req))
@@ -1699,8 +1712,8 @@ static esp_err_t api_data_handler(httpd_req_t *req)
     }
 
     snprintf(json_resp, sizeof(json_resp),
-             "{\"ssid\":\"%s\",\"rssi\":%d,\"fps\":%d,\"brightness\":%ld,\"volume\":%ld,\"osd\":%d,\"time_osd\":%d,\"user\":\"%s\",\"ip\":\"%s\",\"ip6\":\"%s\",\"timezone\":\"%s\",\"udp_port\":%ld,\"rgb_r\":%d,\"rgb_g\":%d,\"rgb_b\":%d,\"sd_mounted\":%d,\"sd_playing\":%d,\"sd_total_mb\":%lu,\"sd_free_mb\":%lu,\"audio\":%d,\"bat_mv\":%d,\"bat_pct\":%d,\"sd_pos\":%lu,\"sd_size\":%lu,\"sd_file\":\"%s\"}",
-             current_ssid, g_current_rssi, g_current_fps, g_current_brightness, g_current_volume, g_show_osd, g_show_time_osd, g_admin_user, g_device_ip, g_device_ip6, g_timezone, g_udp_port, g_rgb_r, g_rgb_g, g_rgb_b, g_sd_card_mounted, g_is_playing_from_sd, (unsigned long)(sd_total / 1048576), (unsigned long)(sd_free / 1048576), g_audio_enable, g_battery_voltage_mv, g_battery_percentage, (unsigned long)g_sd_current_pos, (unsigned long)g_sd_file_size, s_playback_filename);
+             "{\"ssid\":\"%s\",\"rssi\":%d,\"fps\":%d,\"brightness\":%ld,\"volume\":%ld,\"osd\":%d,\"time_osd\":%d,\"user\":\"%s\",\"ip\":\"%s\",\"ip6\":\"%s\",\"timezone\":\"%s\",\"udp_port\":%ld,\"rgb_r\":%d,\"rgb_g\":%d,\"rgb_b\":%d,\"sd_mounted\":%d,\"sd_playing\":%d,\"sd_total_mb\":%lu,\"sd_free_mb\":%lu,\"audio\":%d,\"bat_mv\":%d,\"bat_pct\":%d,\"sd_pos\":%lu,\"sd_size\":%lu,\"sd_file\":\"%s\",\"fw_ver\":\"%s\"}",
+             current_ssid, g_current_rssi, g_current_fps, g_current_brightness, g_current_volume, g_show_osd, g_show_time_osd, g_admin_user, g_device_ip, g_device_ip6, g_timezone, g_udp_port, g_rgb_r, g_rgb_g, g_rgb_b, g_sd_card_mounted, g_is_playing_from_sd, (unsigned long)(sd_total / 1048576), (unsigned long)(sd_free / 1048576), g_audio_enable, g_battery_voltage_mv, g_battery_percentage, (unsigned long)g_sd_current_pos, (unsigned long)g_sd_file_size, s_playback_filename, PROJECT_VER);
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, json_resp, HTTPD_RESP_USE_STRLEN);
     return ESP_OK;
@@ -2182,7 +2195,14 @@ static esp_err_t api_sd_upload_handler(httpd_req_t *req)
 
     while (remaining > 0) {
         int received = httpd_req_recv(req, data_buf, MIN(remaining, 4096));
-        if (received <= 0) {
+        if (received < 0) {
+            if (received == HTTPD_SOCK_ERR_TIMEOUT) {
+                // 超时重试
+                continue;
+            }
+            err = ESP_FAIL;
+            break;
+        } else if (received == 0) {
             err = ESP_FAIL;
             break;
         }
@@ -2191,6 +2211,9 @@ static esp_err_t api_sd_upload_handler(httpd_req_t *req)
             break;
         }
         remaining -= received;
+        
+        // 让出 CPU
+        vTaskDelay(pdMS_TO_TICKS(1));
     }
 
     free(data_buf);
@@ -2262,6 +2285,8 @@ static httpd_handle_t start_webserver(void)
         httpd_register_uri_handler(server, &login_uri);
         httpd_uri_t do_login_uri = {.uri = "/do_login", .method = HTTP_GET, .handler = do_login_handler, .user_ctx = NULL};
         httpd_register_uri_handler(server, &do_login_uri);
+        httpd_uri_t api_version_uri = {.uri = "/api/version", .method = HTTP_GET, .handler = api_version_handler, .user_ctx = NULL};
+        httpd_register_uri_handler(server, &api_version_uri);
         httpd_uri_t api_data_uri = {.uri = "/api/data", .method = HTTP_GET, .handler = api_data_handler, .user_ctx = NULL};
         httpd_register_uri_handler(server, &api_data_uri);
         httpd_uri_t api_set_uri = {.uri = "/api/set", .method = HTTP_GET, .handler = api_set_handler, .user_ctx = NULL};
