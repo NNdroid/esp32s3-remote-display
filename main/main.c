@@ -120,6 +120,8 @@ volatile int32_t g_current_brightness = 60;
 volatile int32_t g_current_volume = 80;
 volatile int8_t g_show_osd = 1;
 volatile bool g_show_time_osd = true;
+volatile int8_t g_mirror_x = 0;
+volatile int8_t g_mirror_y = 0;
 char g_admin_user[32] = "admin";
 char g_admin_pwd[64] = "123456";
 char g_device_ip[20] = "0.0.0.0";
@@ -576,6 +578,14 @@ static void load_settings_from_nvs()
         if (nvs_get_i8(my_handle, "audio_enable", &saved_audio) == ESP_OK)
             g_audio_enable = saved_audio;
 
+        int8_t saved_mx = 0;
+        if (nvs_get_i8(my_handle, "mirror_x", &saved_mx) == ESP_OK)
+            g_mirror_x = saved_mx;
+
+        int8_t saved_my = 0;
+        if (nvs_get_i8(my_handle, "mirror_y", &saved_my) == ESP_OK)
+            g_mirror_y = saved_my;
+
         nvs_commit(my_handle);
         nvs_close(my_handle);
     }
@@ -645,19 +655,20 @@ static void lcd_hardware_init(void)
     ESP_ERROR_CHECK(esp_lcd_panel_reset(panel_handle));
     vTaskDelay(pdMS_TO_TICKS(120));
     ESP_ERROR_CHECK(esp_lcd_panel_init(panel_handle));
-    vTaskDelay(pdMS_TO_TICKS(50));
-    ESP_ERROR_CHECK(esp_lcd_panel_swap_xy(panel_handle, true));
-    uint8_t madctl_val = 0x28;
-    esp_lcd_panel_io_tx_param(io_handle, 0x36, &madctl_val, 1);
-    ESP_ERROR_CHECK(esp_lcd_panel_invert_color(panel_handle, true));
-    ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(panel_handle, true));
-
     load_settings_from_nvs();
     uint32_t init_duty = (g_current_brightness * 255) / 100;
     ledc_timer_config_t ledc_timer = {.speed_mode = LEDC_LOW_SPEED_MODE, .duty_resolution = LEDC_TIMER_8_BIT, .timer_num = LEDC_TIMER_0, .freq_hz = 5000, .clk_cfg = LEDC_AUTO_CLK};
     ledc_timer_config(&ledc_timer);
     ledc_channel_config_t ledc_channel = {.speed_mode = LEDC_LOW_SPEED_MODE, .channel = LEDC_CHANNEL_0, .timer_sel = LEDC_TIMER_0, .intr_type = LEDC_INTR_DISABLE, .gpio_num = TFT_BL, .duty = init_duty, .hpoint = 0};
     ledc_channel_config(&ledc_channel);
+
+    ESP_ERROR_CHECK(esp_lcd_panel_swap_xy(panel_handle, true));
+    uint8_t madctl_val = 0x28;
+    if (g_mirror_x) madctl_val |= 0x40;
+    if (g_mirror_y) madctl_val |= 0x80;
+    esp_lcd_panel_io_tx_param(io_handle, 0x36, &madctl_val, 1);
+    ESP_ERROR_CHECK(esp_lcd_panel_invert_color(panel_handle, true));
+    ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(panel_handle, true));
 }
 
 static void sd_card_init(void)
@@ -1864,8 +1875,8 @@ static esp_err_t api_data_handler(httpd_req_t *req)
     }
 
     snprintf(json_resp, sizeof(json_resp),
-             "{\"ssid\":\"%s\",\"rssi\":%d,\"fps\":%d,\"brightness\":%ld,\"volume\":%ld,\"osd\":%d,\"time_osd\":%d,\"user\":\"%s\",\"ip\":\"%s\",\"ip6\":\"%s\",\"timezone\":\"%s\",\"udp_port\":%ld,\"rgb_r\":%d,\"rgb_g\":%d,\"rgb_b\":%d,\"sd_mounted\":%d,\"sd_playing\":%d,\"sd_total_mb\":%lu,\"sd_free_mb\":%lu,\"audio\":%d,\"bat_mv\":%d,\"bat_pct\":%d,\"sd_pos\":%lu,\"sd_size\":%lu,\"sd_file\":\"%s\",\"fw_ver\":\"%s\",\"audio_plc\":%lu,\"video_drop\":%lu}",
-             current_ssid, g_current_rssi, g_current_fps, g_current_brightness, g_current_volume, g_show_osd, g_show_time_osd, g_admin_user, g_device_ip, g_device_ip6, g_timezone, g_udp_port, g_rgb_r, g_rgb_g, g_rgb_b, g_sd_card_mounted, g_is_playing_from_sd, (unsigned long)(sd_total / 1048576), (unsigned long)(sd_free / 1048576), g_audio_enable, g_battery_voltage_mv, g_battery_percentage, (unsigned long)g_sd_current_pos, (unsigned long)g_sd_file_size, s_playback_filename, PROJECT_VER, (unsigned long)g_audio_plc_count, (unsigned long)g_video_packet_drop_count);
+             "{\"ssid\":\"%s\",\"rssi\":%d,\"fps\":%d,\"brightness\":%ld,\"volume\":%ld,\"osd\":%d,\"time_osd\":%d,\"user\":\"%s\",\"ip\":\"%s\",\"ip6\":\"%s\",\"timezone\":\"%s\",\"udp_port\":%ld,\"rgb_r\":%d,\"rgb_g\":%d,\"rgb_b\":%d,\"sd_mounted\":%d,\"sd_playing\":%d,\"sd_total_mb\":%lu,\"sd_free_mb\":%lu,\"audio\":%d,\"bat_mv\":%d,\"bat_pct\":%d,\"sd_pos\":%lu,\"sd_size\":%lu,\"sd_file\":\"%s\",\"fw_ver\":\"%s\",\"audio_plc\":%lu,\"video_drop\":%lu,\"mirror_x\":%d,\"mirror_y\":%d}",
+             current_ssid, g_current_rssi, g_current_fps, g_current_brightness, g_current_volume, g_show_osd, g_show_time_osd, g_admin_user, g_device_ip, g_device_ip6, g_timezone, g_udp_port, g_rgb_r, g_rgb_g, g_rgb_b, g_sd_card_mounted, g_is_playing_from_sd, (unsigned long)(sd_total / 1048576), (unsigned long)(sd_free / 1048576), g_audio_enable, g_battery_voltage_mv, g_battery_percentage, (unsigned long)g_sd_current_pos, (unsigned long)g_sd_file_size, s_playback_filename, PROJECT_VER, (unsigned long)g_audio_plc_count, (unsigned long)g_video_packet_drop_count, g_mirror_x, g_mirror_y);
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, json_resp, HTTPD_RESP_USE_STRLEN);
     return ESP_OK;
@@ -1941,6 +1952,30 @@ static esp_err_t api_set_handler(httpd_req_t *req)
                 save_i8_to_nvs("audio_enable", g_audio_enable);
             }
             gpio_set_level(PA_EN_PIN, g_audio_enable ? 0 : 1);
+        }
+        if (httpd_query_key_value(buf, "mirror_x", param, sizeof(param)) == ESP_OK)
+        {
+            g_mirror_x = (atoi(param) == 1) ? 1 : 0;
+            if (save)
+            {
+                save_i8_to_nvs("mirror_x", g_mirror_x);
+            }
+            uint8_t madctl_val = 0x28;
+            if (g_mirror_x) madctl_val |= 0x40;
+            if (g_mirror_y) madctl_val |= 0x80;
+            esp_lcd_panel_io_tx_param(io_handle, 0x36, &madctl_val, 1);
+        }
+        if (httpd_query_key_value(buf, "mirror_y", param, sizeof(param)) == ESP_OK)
+        {
+            g_mirror_y = (atoi(param) == 1) ? 1 : 0;
+            if (save)
+            {
+                save_i8_to_nvs("mirror_y", g_mirror_y);
+            }
+            uint8_t madctl_val = 0x28;
+            if (g_mirror_x) madctl_val |= 0x40;
+            if (g_mirror_y) madctl_val |= 0x80;
+            esp_lcd_panel_io_tx_param(io_handle, 0x36, &madctl_val, 1);
         }
         if (httpd_query_key_value(buf, "timezone", param, sizeof(param)) == ESP_OK)
         {

@@ -18,3 +18,4 @@ dependencies:
   espressif/esp_lcd_ili9341: '*'
   espressif/network_provisioning: '*'
   espressif/led_strip: ^3.0.3
+  espressif/esp_jpeg: '*'

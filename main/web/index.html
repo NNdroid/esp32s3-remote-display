@@ -331,6 +331,12 @@
                     <input type="checkbox" id="audio_chk" onchange="setSetting(`audio=${this.checked?1:0}&save=1`)" /> 🔊 Enable Audio Playback
                 </label>
                 <label class="row-checkbox">
+                    <input type="checkbox" id="mirror_x_chk" onchange="setSetting(`mirror_x=${this.checked?1:0}&save=1`)" /> ↔️ Horizontal Mirror (Flip X)
+                </label>
+                <label class="row-checkbox">
+                    <input type="checkbox" id="mirror_y_chk" onchange="setSetting(`mirror_y=${this.checked?1:0}&save=1`)" /> ↕️ Vertical Mirror (Flip Y)
+                </label>
+                <label class="row-checkbox">
                     <input type="checkbox" id="osd_chk" onchange="setSetting(`osd=${this.checked?1:0}`)" /> Show OSD (Stats & Battery)
                 </label>
                 <label class="row-checkbox">
@@ -1142,6 +1148,8 @@
                     document.getElementById("osd_chk").checked = d.osd === 1;
                     document.getElementById("time_osd_chk").checked = d.time_osd === 1;
                     document.getElementById("audio_chk").checked = d.audio === 1;
+                    document.getElementById("mirror_x_chk").checked = d.mirror_x === 1;
+                    document.getElementById("mirror_y_chk").checked = d.mirror_y === 1;
                     if(d.timezone) document.getElementById("tz_select").value = d.timezone;
                     document.getElementById("cfg_user").value = d.user;
                     document.getElementById("udp_port").value = d.udp_port;

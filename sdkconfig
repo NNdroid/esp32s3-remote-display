@@ -3331,6 +3331,13 @@ CONFIG_CU_DIAGNOSTICS_COLOR_ALWAYS=y
 # end of CMake Utilities
 
 #
+# JPEG Decoder
+#
+# default:
+CONFIG_JD_USE_ROM=y
+# end of JPEG Decoder
+
+#
 # Network Provisioning Manager
 #
 # default:
