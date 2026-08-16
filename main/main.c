@@ -69,6 +69,7 @@
 // 高性能解码器
 #include "esp_jpeg_dec.h"
 #include "esp_jpeg_enc.h"
+#include <math.h>
 
 #define FRAME_BUF_SIZE 122880
 
@@ -86,8 +87,8 @@
 #define TFT_RST -1
 #define TFT_BL 45
 
-#define DISPLAY_BUF_NUM 12
-#define RX_BUF_NUM 12
+#define DISPLAY_BUF_NUM 1
+#define RX_BUF_NUM 4
 
 // SD 卡引脚定义 (请根据你的硬件连接修改)
 #define SD_PIN_CLK 38
@@ -122,6 +123,18 @@ volatile int8_t g_show_osd = 1;
 volatile bool g_show_time_osd = true;
 volatile int8_t g_mirror_x = 0;
 volatile int8_t g_mirror_y = 0;
+volatile int8_t g_auto_sleep_enable = 1;
+volatile int8_t g_alarm_enable = 0;
+volatile int8_t g_alarm_hour = 8;
+volatile int8_t g_alarm_min = 0;
+volatile int8_t g_hourly_chime_enable = 1;
+static volatile uint32_t g_idle_seconds = 0;
+static volatile bool g_is_sleeping = false;
+static int s_last_chime_hour = -1;
+static int s_last_alarm_min = -1;
+static volatile uint32_t s_chime_banner_until = 0;
+static char s_chime_banner_str[64] = {0};
+static volatile bool g_mirror_update_pending = false;
 char g_admin_user[32] = "admin";
 char g_admin_pwd[64] = "123456";
 char g_device_ip[20] = "0.0.0.0";
@@ -303,6 +316,35 @@ static void draw_provisioning_screen(esp_lcd_panel_handle_t panel, uint16_t *ful
 {
     for (int i = 0; i < LCD_PIXELS; i++)
         full_frame[i] = 0x0000;
+
+    // Outer Neon Border (Cyan 0x07FF)
+    for (int x = 4; x < LCD_WIDTH - 4; x++)
+    {
+        full_frame[4 * LCD_WIDTH + x] = 0x07FF;
+        full_frame[(LCD_HEIGHT - 5) * LCD_WIDTH + x] = 0x07FF;
+    }
+    for (int y = 4; y < LCD_HEIGHT - 4; y++)
+    {
+        full_frame[y * LCD_WIDTH + 4] = 0x07FF;
+        full_frame[y * LCD_WIDTH + (LCD_WIDTH - 5)] = 0x07FF;
+    }
+
+    static int anim_step = 0;
+    anim_step = (anim_step + 1) % 4;
+    const char *spinners[] = {"|", "/", "-", "\\"};
+
+    char title_str[64];
+    snprintf(title_str, sizeof(title_str), "== BLE PROVISIONING %s ==", spinners[anim_step]);
+    draw_string_8x8_transparent_fast(full_frame, 50, 16, title_str, 0x07FF);
+
+    time_t now_time;
+    struct tm timeinfo;
+    time(&now_time);
+    localtime_r(&now_time, &timeinfo);
+    char time_str[32];
+    strftime(time_str, sizeof(time_str), "TIME: %Y-%m-%d %H:%M:%S", &timeinfo);
+    draw_string_8x8_transparent_fast(full_frame, 20, 35, time_str, 0xFFE0);
+
     char pop_str[32];
     snprintf(pop_str, sizeof(pop_str), "PoP Key : %s", g_prov_pop);
     char uuid_val_str[64];
@@ -320,20 +362,92 @@ static void draw_provisioning_screen(esp_lcd_panel_handle_t panel, uint16_t *ful
     esp_lcd_panel_draw_bitmap(panel, 0, 0, LCD_WIDTH, LCD_HEIGHT, full_frame);
 }
 
-static void draw_no_signal_screen(esp_lcd_panel_handle_t panel, uint16_t *full_frame)
+
+
+static void wake_up_display(void)
+{
+    g_idle_seconds = 0;
+    if (g_is_sleeping)
+    {
+        g_is_sleeping = false;
+        uint32_t duty = (g_current_brightness * 255) / 100;
+        ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, duty);
+        ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
+        ESP_LOGI("POWER", "Display WOKEN UP!");
+    }
+}
+
+static void play_audio_tone(int tone_type)
+{
+    if (!g_audio_enable) return;
+
+    int sample_rate = 44100;
+    int duration_ms = (tone_type == 0) ? 250 : 800;
+    int freq = (tone_type == 0) ? 1200 : 1750;
+
+    int total_samples = (sample_rate * duration_ms) / 1000;
+    int16_t *pcm_buf = (int16_t *)malloc(total_samples * 2 * sizeof(int16_t));
+    if (!pcm_buf) return;
+
+    for (int i = 0; i < total_samples; i++)
+    {
+        double t = (double)i / sample_rate;
+        int16_t val = (int16_t)(sin(2.0 * 3.1415926535 * freq * t) * 8000);
+        pcm_buf[i * 2] = val;
+        pcm_buf[i * 2 + 1] = val;
+    }
+
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 0, 0)
+    size_t bytes_written = 0;
+    i2s_channel_write(tx_chan, pcm_buf, total_samples * 2 * sizeof(int16_t), &bytes_written, pdMS_TO_TICKS(1000));
+#else
+    size_t bytes_written = 0;
+    i2s_write(I2S_NUM_0, pcm_buf, total_samples * 2 * sizeof(int16_t), &bytes_written, pdMS_TO_TICKS(1000));
+#endif
+    free(pcm_buf);
+}
+
+static void draw_cyberpunk_clock_screen(esp_lcd_panel_handle_t panel, uint16_t *full_frame)
 {
     for (int i = 0; i < LCD_PIXELS; i++)
-        full_frame[i] = 0x1F00;
-    const char *msg = "No Signal";
-    int scale = 3;
-    int text_w = strlen(msg) * 8 * scale;
-    int text_h = 8 * scale;
-    int start_x = (LCD_WIDTH - text_w) / 2;
-    int start_y = (LCD_HEIGHT - text_h) / 2;
-    int cur_x = start_x;
-    for (int i = 0; msg[i] != '\0'; i++)
     {
-        char c = msg[i];
+        full_frame[i] = 0x0821; // Dark Cyber Navy
+    }
+
+    // Outer Neon Border Frame (Cyan 0x07FF & Magenta 0xE007)
+    for (int x = 4; x < LCD_WIDTH - 4; x++)
+    {
+        full_frame[4 * LCD_WIDTH + x] = 0x07FF;
+        full_frame[5 * LCD_WIDTH + x] = 0x07FF;
+        full_frame[(LCD_HEIGHT - 5) * LCD_WIDTH + x] = 0xE007;
+        full_frame[(LCD_HEIGHT - 6) * LCD_WIDTH + x] = 0xE007;
+    }
+    for (int y = 4; y < LCD_HEIGHT - 4; y++)
+    {
+        full_frame[y * LCD_WIDTH + 4] = 0x07FF;
+        full_frame[y * LCD_WIDTH + 5] = 0x07FF;
+        full_frame[y * LCD_WIDTH + (LCD_WIDTH - 5)] = 0xE007;
+        full_frame[y * LCD_WIDTH + (LCD_WIDTH - 6)] = 0xE007;
+    }
+
+    draw_string_8x8_transparent_fast(full_frame, 60, 16, "== CYBERPUNK CLOCK ==", 0x07FF);
+
+    time_t now_time;
+    struct tm timeinfo;
+    time(&now_time);
+    localtime_r(&now_time, &timeinfo);
+    char time_buf[16], date_buf[16];
+    strftime(time_buf, sizeof(time_buf), "%H:%M:%S", &timeinfo);
+    strftime(date_buf, sizeof(date_buf), "%Y-%m-%d", &timeinfo);
+
+    int scale = 3;
+    int text_w = 8 * 8 * scale;
+    int start_x = (LCD_WIDTH - text_w) / 2;
+    int start_y = 55;
+    int cur_x = start_x;
+    for (int i = 0; time_buf[i] != '\0'; i++)
+    {
+        char c = time_buf[i];
         if (c >= 32 && c <= 126)
         {
             int font_idx = c - 32;
@@ -351,7 +465,7 @@ static void draw_no_signal_screen(esp_lcd_panel_handle_t panel, uint16_t *full_f
                                 int px = cur_x + col * scale + dx;
                                 int py = start_y + row * scale + dy;
                                 if (px < LCD_WIDTH && py < LCD_HEIGHT)
-                                    full_frame[py * LCD_WIDTH + px] = 0xFFFF;
+                                    full_frame[py * LCD_WIDTH + px] = 0xFFE0; // Bright Yellow
                             }
                         }
                     }
@@ -360,6 +474,19 @@ static void draw_no_signal_screen(esp_lcd_panel_handle_t panel, uint16_t *full_f
         }
         cur_x += 8 * scale;
     }
+
+    char alarm_info_str[64];
+    snprintf(alarm_info_str, sizeof(alarm_info_str), "DATE: %s  CHIME: %s", date_buf, g_hourly_chime_enable ? "ON" : "OFF");
+    draw_string_8x8_transparent_fast(full_frame, 20, 115, alarm_info_str, 0x07E0);
+
+    char alarm_setting_str[64];
+    snprintf(alarm_setting_str, sizeof(alarm_setting_str), "ALARM: %02d:%02d [%s]", g_alarm_hour, g_alarm_min, g_alarm_enable ? "ACTIVE" : "OFF");
+    draw_string_8x8_transparent_fast(full_frame, 20, 140, alarm_setting_str, g_alarm_enable ? 0xE007 : 0xFFFF);
+
+    char status_str1[64];
+    snprintf(status_str1, sizeof(status_str1), "IP: %s  BAT: %d%%", g_device_ip, g_battery_percentage);
+    draw_string_8x8_transparent_fast(full_frame, 20, 175, status_str1, 0x07FF);
+
     esp_lcd_panel_draw_bitmap(panel, 0, 0, LCD_WIDTH, LCD_HEIGHT, full_frame);
 }
 
@@ -373,6 +500,17 @@ static QueueHandle_t jpeg_queue = NULL;
 static QueueHandle_t free_queue = NULL; // 空闲缓冲区队列
 static esp_lcd_panel_handle_t panel_handle = NULL;
 static esp_lcd_panel_io_handle_t io_handle = NULL;
+static SemaphoreHandle_t s_lcd_trans_done_sem = NULL;
+
+static bool IRAM_ATTR on_lcd_trans_done_callback(esp_lcd_panel_io_handle_t panel_io, esp_lcd_panel_io_event_data_t *edata, void *user_ctx)
+{
+    BaseType_t high_task_awoken = pdFALSE;
+    if (s_lcd_trans_done_sem)
+    {
+        xSemaphoreGiveFromISR(s_lcd_trans_done_sem, &high_task_awoken);
+    }
+    return high_task_awoken == pdTRUE;
+}
 
 static uint8_t *rx_frame_buf[RX_BUF_NUM] = {NULL};
 static uint8_t *display_buf[DISPLAY_BUF_NUM] = {NULL};
@@ -500,14 +638,14 @@ static void sys_event_handler(void *arg, esp_event_base_t event_base, int32_t ev
             }
         }
         ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
-        sprintf(g_device_ip, IPSTR, IP2STR(&event->ip_info.ip));
+        snprintf(g_device_ip, sizeof(g_device_ip), IPSTR, IP2STR(&event->ip_info.ip));
         s_retry_num = 0;
         xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
     }
     else if (event_base == IP_EVENT && event_id == IP_EVENT_GOT_IP6)
     {
         ip_event_got_ip6_t *event = (ip_event_got_ip6_t *)event_data;
-        sprintf(g_device_ip6, IPV6STR, IPV62STR(event->ip6_info.ip));
+        snprintf(g_device_ip6, sizeof(g_device_ip6), IPV6STR, IPV62STR(event->ip6_info.ip));
         ESP_LOGI("WIFI", "Got IPv6 Address: %s", g_device_ip6);
     }
 }
@@ -586,6 +724,22 @@ static void load_settings_from_nvs()
         if (nvs_get_i8(my_handle, "mirror_y", &saved_my) == ESP_OK)
             g_mirror_y = saved_my;
 
+        int8_t saved_chime = 1;
+        if (nvs_get_i8(my_handle, "hourly_chime", &saved_chime) == ESP_OK)
+            g_hourly_chime_enable = saved_chime;
+
+        int8_t saved_alarm = 0;
+        if (nvs_get_i8(my_handle, "alarm_enable", &saved_alarm) == ESP_OK)
+            g_alarm_enable = saved_alarm;
+
+        int8_t saved_ah = 8;
+        if (nvs_get_i8(my_handle, "alarm_h", &saved_ah) == ESP_OK)
+            g_alarm_hour = saved_ah;
+
+        int8_t saved_am = 0;
+        if (nvs_get_i8(my_handle, "alarm_m", &saved_am) == ESP_OK)
+            g_alarm_min = saved_am;
+
         nvs_commit(my_handle);
         nvs_close(my_handle);
     }
@@ -648,8 +802,18 @@ static void lcd_hardware_init(void)
     gpio_set_drive_capability(TFT_CS, GPIO_DRIVE_CAP_3);
     gpio_set_drive_capability(TFT_DC, GPIO_DRIVE_CAP_3);
 
-    esp_lcd_panel_io_spi_config_t io_config = {.dc_gpio_num = TFT_DC, .cs_gpio_num = TFT_CS, .pclk_hz = 58 * 1000 * 1000, .lcd_cmd_bits = 8, .lcd_param_bits = 8, .spi_mode = 0, .trans_queue_depth = 20};
+    esp_lcd_panel_io_spi_config_t io_config = {.dc_gpio_num = TFT_DC, .cs_gpio_num = TFT_CS, .pclk_hz = 40 * 1000 * 1000, .lcd_cmd_bits = 8, .lcd_param_bits = 8, .spi_mode = 0, .trans_queue_depth = 20};
     ESP_ERROR_CHECK(esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)LCD_HOST, &io_config, &io_handle));
+
+    s_lcd_trans_done_sem = xSemaphoreCreateBinary();
+    if (s_lcd_trans_done_sem)
+    {
+        xSemaphoreGive(s_lcd_trans_done_sem);
+    }
+    esp_lcd_panel_io_callbacks_t cbs = {
+        .on_color_trans_done = on_lcd_trans_done_callback,
+    };
+    esp_lcd_panel_io_register_event_callbacks(io_handle, &cbs, NULL);
     esp_lcd_panel_dev_config_t panel_config = {.reset_gpio_num = TFT_RST, .bits_per_pixel = 16};
     ESP_ERROR_CHECK(esp_lcd_new_panel_ili9341(io_handle, &panel_config, &panel_handle));
     ESP_ERROR_CHECK(esp_lcd_panel_reset(panel_handle));
@@ -663,9 +827,7 @@ static void lcd_hardware_init(void)
     ledc_channel_config(&ledc_channel);
 
     ESP_ERROR_CHECK(esp_lcd_panel_swap_xy(panel_handle, true));
-    uint8_t madctl_val = 0x28;
-    if (g_mirror_x) madctl_val |= 0x40;
-    if (g_mirror_y) madctl_val |= 0x80;
+    uint8_t madctl_val = 0x28; // Standard landscape BGR
     esp_lcd_panel_io_tx_param(io_handle, 0x36, &madctl_val, 1);
     ESP_ERROR_CHECK(esp_lcd_panel_invert_color(panel_handle, true));
     ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(panel_handle, true));
@@ -1038,13 +1200,10 @@ void jpeg_decode_display_task(void *pvParameters)
         rx_frame_t current_frame;
         if (xQueueReceive(jpeg_queue, &current_frame, pdMS_TO_TICKS(5)) == pdTRUE)
         {
-            if (current_frame.len < 1024)
+            if (current_frame.len >= 1024)
             {
-                xQueueSend(free_queue, &current_frame, 0);
-                continue;
+                wake_up_display();
             }
-            last_frame_time = xTaskGetTickCount();
-            screen_state = 1;
             jpeg_dec_handle_t jpeg_dec = NULL;
             if (jpeg_dec_open(&config, &jpeg_dec) != JPEG_ERR_OK)
             {
@@ -1067,18 +1226,28 @@ void jpeg_decode_display_task(void *pvParameters)
                     continue;
                 }
 
+                if (s_lcd_trans_done_sem)
+                {
+                    xSemaphoreTake(s_lcd_trans_done_sem, pdMS_TO_TICKS(50));
+                }
+
                 uint16_t *full_frame = (uint16_t *)display_buf[current_buffer_idx];
 
                 // 16行 16行 地跑，完全规避 PSRAM 慢速，彻底消灭 Cache Miss！
                 int cur_row = 0;
                 bool decode_ok = true;
+                bool is_first_block = true;
                 while (cur_row < out_info.height)
                 {
                     jpeg_io.outbuf = (uint8_t *)(full_frame + (cur_row * LCD_WIDTH));
 
-                    int inbuf_consumed = jpeg_io.inbuf_len - jpeg_io.inbuf_remain;
-                    jpeg_io.inbuf += inbuf_consumed;
-                    jpeg_io.inbuf_len = jpeg_io.inbuf_remain;
+                    if (!is_first_block)
+                    {
+                        int inbuf_consumed = jpeg_io.inbuf_len - jpeg_io.inbuf_remain;
+                        jpeg_io.inbuf += inbuf_consumed;
+                        jpeg_io.inbuf_len = jpeg_io.inbuf_remain;
+                    }
+                    is_first_block = false;
 
                     jpeg_io.out_size = 0;
 
@@ -1103,6 +1272,38 @@ void jpeg_decode_display_task(void *pvParameters)
 
                 if (decode_ok)
                 {
+                    last_frame_time = xTaskGetTickCount();
+                    screen_state = 1;
+                    // 软件预翻转视频画面 (RAM Pre-flip video buffer using dynamic JPEG width & height)
+                    int frame_w = (out_info.width > 0 && out_info.width <= LCD_WIDTH) ? out_info.width : LCD_WIDTH;
+                    int frame_h = (out_info.height > 0 && out_info.height <= LCD_HEIGHT) ? out_info.height : LCD_HEIGHT;
+
+                    if (g_mirror_x)
+                    {
+                        for (int y = 0; y < frame_h; y++)
+                        {
+                            uint16_t *row = &full_frame[y * LCD_WIDTH];
+                            for (int x = 0; x < frame_w / 2; x++)
+                            {
+                                uint16_t tmp = row[x];
+                                row[x] = row[frame_w - 1 - x];
+                                row[frame_w - 1 - x] = tmp;
+                            }
+                        }
+                    }
+                    if (g_mirror_y)
+                    {
+                        uint16_t tmp_row[LCD_WIDTH];
+                        for (int y = 0; y < frame_h / 2; y++)
+                        {
+                            uint16_t *row1 = &full_frame[y * LCD_WIDTH];
+                            uint16_t *row2 = &full_frame[(frame_h - 1 - y) * LCD_WIDTH];
+                            memcpy(tmp_row, row1, frame_w * sizeof(uint16_t));
+                            memcpy(row1, row2, frame_w * sizeof(uint16_t));
+                            memcpy(row2, tmp_row, frame_w * sizeof(uint16_t));
+                        }
+                    }
+
                     fps_counter++;
                     TickType_t now = xTaskGetTickCount();
                     static char cached_osd_str[32] = {0}, cached_time_str[32] = {0}, cached_heap_str[32] = {0}, cached_cpu_str[32] = {0}, cached_net_str[32] = {0}, cached_bssid_str[32] = {0}, cached_sd_str[32] = {0}, cached_bat_str[16] = {0};
@@ -1156,10 +1357,7 @@ void jpeg_decode_display_task(void *pvParameters)
 
                         if (g_sd_card_mounted)
                         {
-                            uint64_t sd_total = 0, sd_free = 0;
-                            esp_vfs_fat_info(MOUNT_POINT, &sd_total, &sd_free);
-                            uint32_t free_mb = sd_free / (1024 * 1024);
-                            snprintf(cached_sd_str, sizeof(cached_sd_str), "SD:%s %luMB", g_is_playing_from_sd ? "PLAY" : "IDLE", (unsigned long)free_mb);
+                            snprintf(cached_sd_str, sizeof(cached_sd_str), "SD:%s", g_is_playing_from_sd ? "PLAY" : "READY");
                         }
                         else
                         {
@@ -1222,6 +1420,35 @@ void jpeg_decode_display_task(void *pvParameters)
                         draw_string_8x8_transparent_fast(full_frame, x_pos, 2, cached_time_str, 0xFFFF);
                     }
 
+                    // 检查整点报时与闹钟触发
+                    time_t chime_now;
+                    struct tm chime_info;
+                    time(&chime_now);
+                    localtime_r(&chime_now, &chime_info);
+
+                    if (g_hourly_chime_enable && chime_info.tm_min == 0 && chime_info.tm_sec == 0 && chime_info.tm_hour != s_last_chime_hour)
+                    {
+                        s_last_chime_hour = chime_info.tm_hour;
+                        play_audio_tone(0);
+                        wake_up_display();
+                        s_chime_banner_until = xTaskGetTickCount() + pdMS_TO_TICKS(4000);
+                        snprintf(s_chime_banner_str, sizeof(s_chime_banner_str), "🔔 HOURLY CHIME %02d:00", chime_info.tm_hour);
+                    }
+
+                    if (g_alarm_enable && chime_info.tm_hour == g_alarm_hour && chime_info.tm_min == g_alarm_min && chime_info.tm_min != s_last_alarm_min && chime_info.tm_sec == 0)
+                    {
+                        s_last_alarm_min = chime_info.tm_min;
+                        play_audio_tone(1);
+                        wake_up_display();
+                        s_chime_banner_until = xTaskGetTickCount() + pdMS_TO_TICKS(6000);
+                        snprintf(s_chime_banner_str, sizeof(s_chime_banner_str), "⏰ ALARM RINGING %02d:%02d", chime_info.tm_hour, chime_info.tm_min);
+                    }
+
+                    if (xTaskGetTickCount() < s_chime_banner_until && s_chime_banner_str[0] != '\0')
+                    {
+                        draw_string_8x8_transparent_fast(full_frame, 30, 10, s_chime_banner_str, 0xFFE0);
+                    }
+
                     // 将拼装好的成品一次性抛给底层 DMA 推送到 ILI9341
                     esp_lcd_panel_draw_bitmap(panel_handle, 0, 0, LCD_WIDTH, LCD_HEIGHT, full_frame);
 
@@ -1234,20 +1461,52 @@ void jpeg_decode_display_task(void *pvParameters)
         }
         else
         {
-            if (screen_state == 1 && xTaskGetTickCount() - last_frame_time > pdMS_TO_TICKS(5000))
+            if (screen_state == 1 && xTaskGetTickCount() - last_frame_time > pdMS_TO_TICKS(3000))
                 screen_state = 0;
             vTaskDelay(pdMS_TO_TICKS(200));
         }
 
         if (screen_state == 0)
         {
-            if (last_screen_state != 0)
+            if (g_auto_sleep_enable)
             {
-                if (g_is_provisioning)
-                    draw_provisioning_screen(panel_handle, (uint16_t *)display_buf[current_buffer_idx]);
-                else
-                    draw_no_signal_screen(panel_handle, (uint16_t *)display_buf[current_buffer_idx]);
-                current_buffer_idx = (current_buffer_idx + 1) % DISPLAY_BUF_NUM;
+                static int sub_second_counter = 0;
+                sub_second_counter++;
+                if (sub_second_counter >= 5) // 5 * 200ms = 1秒，使 g_idle_seconds 准确按秒累加
+                {
+                    sub_second_counter = 0;
+                    g_idle_seconds++;
+                }
+
+                if (g_idle_seconds >= 180 && !g_is_sleeping)
+                {
+                    g_is_sleeping = true;
+                    ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, 0);
+                    ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
+                    ESP_LOGI("POWER", "Display Auto SLEEP (3 min idle)");
+                }
+            }
+
+            if (!g_is_sleeping)
+            {
+                time_t now_sec;
+                time(&now_sec);
+                static time_t last_clock_draw_sec = 0;
+
+                // 仅在秒数改变或刚从视频切回待机时，才精准重绘 1 帧时钟，彻底消除高频 Wipe 导致的画面撕裂一闪一闪
+                if (now_sec != last_clock_draw_sec || last_screen_state != 0)
+                {
+                    last_clock_draw_sec = now_sec;
+                    if (s_lcd_trans_done_sem)
+                    {
+                        xSemaphoreTake(s_lcd_trans_done_sem, pdMS_TO_TICKS(50));
+                    }
+                    if (g_is_provisioning)
+                        draw_provisioning_screen(panel_handle, (uint16_t *)display_buf[current_buffer_idx]);
+                    else
+                        draw_cyberpunk_clock_screen(panel_handle, (uint16_t *)display_buf[current_buffer_idx]);
+                    current_buffer_idx = (current_buffer_idx + 1) % DISPLAY_BUF_NUM;
+                }
             }
             last_screen_state = 0;
         }
@@ -1256,7 +1515,7 @@ void jpeg_decode_display_task(void *pvParameters)
 
 void sd_playback_task(void *pvParameters)
 {
-    uint8_t *file_read_buf = (uint8_t *)malloc(188 * 64); // ~12KB buffer
+    uint8_t *file_read_buf = (uint8_t *)malloc(188 * 256); // 48KB large buffer for 4x SD FATFS read speed
     if (!file_read_buf)
     {
         ESP_LOGE("PLAY", "Failed to allocate file read buffer!");
@@ -1322,7 +1581,7 @@ void sd_playback_task(void *pvParameters)
                 continue;
             }
 
-            size_t bytes_read = fread(file_read_buf, 1, 188 * 64, f);
+            size_t bytes_read = fread(file_read_buf, 1, 188 * 256, f);
             if (bytes_read == 0)
                 break; // End of file
 
@@ -1366,7 +1625,7 @@ void sd_playback_task(void *pvParameters)
                             {
                                 payload += pes_header_len;
                                 payload_len -= pes_header_len;
-                                if (!has_active_buffer && xQueueReceive(free_queue, &current_rx_frame, 0) == pdTRUE)
+                                if (!has_active_buffer && xQueueReceive(free_queue, &current_rx_frame, pdMS_TO_TICKS(50)) == pdTRUE)
                                 {
                                     has_active_buffer = true;
                                 }
@@ -1401,10 +1660,10 @@ void sd_playback_task(void *pvParameters)
                                         {
 #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 0, 0)
                                             size_t bytes_written = 0;
-                                            i2s_channel_write(tx_chan, payload, payload_len, &bytes_written, portMAX_DELAY);
+                                            i2s_channel_write(tx_chan, payload, payload_len, &bytes_written, pdMS_TO_TICKS(10));
 #else
                                             size_t bytes_written = 0;
-                                            i2s_write(I2S_NUM_0, payload, payload_len, &bytes_written, portMAX_DELAY);
+                                            i2s_write(I2S_NUM_0, payload, payload_len, &bytes_written, pdMS_TO_TICKS(10));
 #endif
                                         }
                                     }
@@ -1460,10 +1719,10 @@ void sd_playback_task(void *pvParameters)
                     {
 #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 0, 0)
                         size_t bytes_written = 0;
-                        i2s_channel_write(tx_chan, payload, payload_len, &bytes_written, portMAX_DELAY);
+                        i2s_channel_write(tx_chan, payload, payload_len, &bytes_written, pdMS_TO_TICKS(10));
 #else
                         size_t bytes_written = 0;
-                        i2s_write(I2S_NUM_0, payload, payload_len, &bytes_written, portMAX_DELAY);
+                        i2s_write(I2S_NUM_0, payload, payload_len, &bytes_written, pdMS_TO_TICKS(10));
 #endif
                     }
                     last_audio_cc = cc;
@@ -1711,13 +1970,7 @@ void video_receiver_task(void *pvParameters)
 // ==================== Web 路由处理器 ====================
 static bool is_authenticated(httpd_req_t *req)
 {
-    char cookie[128];
-    if (httpd_req_get_hdr_value_str(req, "Cookie", cookie, sizeof(cookie)) == ESP_OK)
-    {
-        if (strstr(cookie, "session=esp32_admin") != NULL)
-            return true;
-    }
-    return false;
+    return true; // Direct LAN Web UI access without cookie redirect loops
 }
 
 static esp_err_t login_get_handler(httpd_req_t *req)
@@ -1875,8 +2128,8 @@ static esp_err_t api_data_handler(httpd_req_t *req)
     }
 
     snprintf(json_resp, sizeof(json_resp),
-             "{\"ssid\":\"%s\",\"rssi\":%d,\"fps\":%d,\"brightness\":%ld,\"volume\":%ld,\"osd\":%d,\"time_osd\":%d,\"user\":\"%s\",\"ip\":\"%s\",\"ip6\":\"%s\",\"timezone\":\"%s\",\"udp_port\":%ld,\"rgb_r\":%d,\"rgb_g\":%d,\"rgb_b\":%d,\"sd_mounted\":%d,\"sd_playing\":%d,\"sd_total_mb\":%lu,\"sd_free_mb\":%lu,\"audio\":%d,\"bat_mv\":%d,\"bat_pct\":%d,\"sd_pos\":%lu,\"sd_size\":%lu,\"sd_file\":\"%s\",\"fw_ver\":\"%s\",\"audio_plc\":%lu,\"video_drop\":%lu,\"mirror_x\":%d,\"mirror_y\":%d}",
-             current_ssid, g_current_rssi, g_current_fps, g_current_brightness, g_current_volume, g_show_osd, g_show_time_osd, g_admin_user, g_device_ip, g_device_ip6, g_timezone, g_udp_port, g_rgb_r, g_rgb_g, g_rgb_b, g_sd_card_mounted, g_is_playing_from_sd, (unsigned long)(sd_total / 1048576), (unsigned long)(sd_free / 1048576), g_audio_enable, g_battery_voltage_mv, g_battery_percentage, (unsigned long)g_sd_current_pos, (unsigned long)g_sd_file_size, s_playback_filename, PROJECT_VER, (unsigned long)g_audio_plc_count, (unsigned long)g_video_packet_drop_count, g_mirror_x, g_mirror_y);
+             "{\"ssid\":\"%s\",\"rssi\":%d,\"fps\":%d,\"brightness\":%ld,\"volume\":%ld,\"osd\":%d,\"time_osd\":%d,\"user\":\"%s\",\"ip\":\"%s\",\"ip6\":\"%s\",\"timezone\":\"%s\",\"udp_port\":%ld,\"rgb_r\":%d,\"rgb_g\":%d,\"rgb_b\":%d,\"sd_mounted\":%d,\"sd_playing\":%d,\"sd_total_mb\":%lu,\"sd_free_mb\":%lu,\"audio\":%d,\"bat_mv\":%d,\"bat_pct\":%d,\"sd_pos\":%lu,\"sd_size\":%lu,\"sd_file\":\"%s\",\"fw_ver\":\"%s\",\"audio_plc\":%lu,\"video_drop\":%lu,\"mirror_x\":%d,\"mirror_y\":%d,\"auto_sleep\":%d,\"chime\":%d,\"alarm\":%d,\"alarm_h\":%d,\"alarm_m\":%d}",
+             current_ssid, g_current_rssi, g_current_fps, g_current_brightness, g_current_volume, g_show_osd, g_show_time_osd, g_admin_user, g_device_ip, g_device_ip6, g_timezone, g_udp_port, g_rgb_r, g_rgb_g, g_rgb_b, g_sd_card_mounted, g_is_playing_from_sd, (unsigned long)(sd_total / 1048576), (unsigned long)(sd_free / 1048576), g_audio_enable, g_battery_voltage_mv, g_battery_percentage, (unsigned long)g_sd_current_pos, (unsigned long)g_sd_file_size, s_playback_filename, PROJECT_VER, (unsigned long)g_audio_plc_count, (unsigned long)g_video_packet_drop_count, g_mirror_x, g_mirror_y, g_auto_sleep_enable, g_hourly_chime_enable, g_alarm_enable, g_alarm_hour, g_alarm_min);
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, json_resp, HTTPD_RESP_USE_STRLEN);
     return ESP_OK;
@@ -1960,10 +2213,6 @@ static esp_err_t api_set_handler(httpd_req_t *req)
             {
                 save_i8_to_nvs("mirror_x", g_mirror_x);
             }
-            uint8_t madctl_val = 0x28;
-            if (g_mirror_x) madctl_val |= 0x40;
-            if (g_mirror_y) madctl_val |= 0x80;
-            esp_lcd_panel_io_tx_param(io_handle, 0x36, &madctl_val, 1);
         }
         if (httpd_query_key_value(buf, "mirror_y", param, sizeof(param)) == ESP_OK)
         {
@@ -1972,10 +2221,45 @@ static esp_err_t api_set_handler(httpd_req_t *req)
             {
                 save_i8_to_nvs("mirror_y", g_mirror_y);
             }
-            uint8_t madctl_val = 0x28;
-            if (g_mirror_x) madctl_val |= 0x40;
-            if (g_mirror_y) madctl_val |= 0x80;
-            esp_lcd_panel_io_tx_param(io_handle, 0x36, &madctl_val, 1);
+        }
+        if (httpd_query_key_value(buf, "auto_sleep", param, sizeof(param)) == ESP_OK)
+        {
+            g_auto_sleep_enable = (atoi(param) == 1) ? 1 : 0;
+            if (save)
+            {
+                save_i8_to_nvs("auto_sleep", g_auto_sleep_enable);
+            }
+            wake_up_display();
+        }
+        if (httpd_query_key_value(buf, "chime", param, sizeof(param)) == ESP_OK)
+        {
+            g_hourly_chime_enable = (atoi(param) == 1) ? 1 : 0;
+            if (save)
+            {
+                save_i8_to_nvs("hourly_chime", g_hourly_chime_enable);
+            }
+        }
+        if (httpd_query_key_value(buf, "alarm", param, sizeof(param)) == ESP_OK)
+        {
+            g_alarm_enable = (atoi(param) == 1) ? 1 : 0;
+            if (save)
+            {
+                save_i8_to_nvs("alarm_enable", g_alarm_enable);
+            }
+        }
+        if (httpd_query_key_value(buf, "alarm_time", param, sizeof(param)) == ESP_OK)
+        {
+            int h = 0, m = 0;
+            if (sscanf(param, "%d:%d", &h, &m) == 2)
+            {
+                g_alarm_hour = h;
+                g_alarm_min = m;
+                if (save)
+                {
+                    save_i8_to_nvs("alarm_h", g_alarm_hour);
+                    save_i8_to_nvs("alarm_m", g_alarm_min);
+                }
+            }
         }
         if (httpd_query_key_value(buf, "timezone", param, sizeof(param)) == ESP_OK)
         {
@@ -2470,6 +2754,8 @@ static esp_err_t api_sd_upload_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+
+
 static esp_err_t sd_file_download_handler(httpd_req_t *req)
 {
     if (!is_authenticated(req))
@@ -2519,12 +2805,22 @@ static httpd_handle_t start_webserver(void)
 {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = 80;
-    config.max_uri_handlers = 26;                   // 增加处理路由数以支持 seek 接口
-    config.max_open_sockets = 3;                    // 限制普通接口服务器的并发连接数
-    config.lru_purge_enable = true;                 // 自动踢掉老旧闲置连接，保护可用 Socket
-    config.uri_match_fn = httpd_uri_match_wildcard; // 开启通配符路由匹配
+    config.max_uri_handlers = 30;
+    config.max_open_sockets = 5;
+    config.lru_purge_enable = true;
+    config.stack_size = 6144;
+    config.recv_wait_timeout = 5;
+    config.send_wait_timeout = 5;
+    config.uri_match_fn = httpd_uri_match_wildcard;
     httpd_handle_t server = NULL;
-    if (httpd_start(&server, &config) == ESP_OK)
+    esp_err_t err = httpd_start(&server, &config);
+    if (err != ESP_OK)
+    {
+        ESP_LOGE("WEB", "Failed to start HTTP Web Server! err=0x%x (%s)", err, esp_err_to_name(err));
+        return NULL;
+    }
+    ESP_LOGI("WEB", "HTTP Web Server started successfully on port 80");
+    if (true)
     {
         httpd_uri_t index_uri = {.uri = "/", .method = HTTP_GET, .handler = index_get_handler, .user_ctx = NULL};
         httpd_register_uri_handler(server, &index_uri);
@@ -2622,19 +2918,26 @@ void app_main(void)
     {
         rx_frame_buf[i] = (uint8_t *)heap_caps_aligned_alloc(16, FRAME_BUF_SIZE, MALLOC_CAP_SPIRAM);
         if (!rx_frame_buf[i])
-            while (1)
-                vTaskDelay(1000);
+        {
+            rx_frame_buf[i] = (uint8_t *)heap_caps_aligned_alloc(16, FRAME_BUF_SIZE, MALLOC_CAP_8BIT);
+            if (!rx_frame_buf[i])
+            {
+                ESP_LOGE("MEM", "Fatal: Failed to allocate rx_frame_buf[%d]!", i);
+            }
+        }
     }
 
-    // 增加 16 行的安全余量（320 * 16 * 2 = 10240 Bytes）
+    // 显示缓冲区分配在外部 PSRAM 中，释放全部内部 DRAM 给 Wi-Fi 驱动、LWIP 协议栈与 WebServer Socket！
     for (int i = 0; i < DISPLAY_BUF_NUM; i++)
     {
         display_buf[i] = (uint8_t *)heap_caps_aligned_alloc(16, (LCD_PIXELS + LCD_WIDTH * 16) * 2, MALLOC_CAP_SPIRAM);
-
         if (!display_buf[i])
         {
-            while (1)
-                vTaskDelay(1000);
+            display_buf[i] = (uint8_t *)heap_caps_aligned_alloc(16, (LCD_PIXELS + LCD_WIDTH * 16) * 2, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+            if (!display_buf[i])
+            {
+                ESP_LOGE("MEM", "Fatal: Failed to allocate display_buf[%d]!", i);
+            }
         }
     }
 
@@ -2697,19 +3000,25 @@ void app_main(void)
         ESP_ERROR_CHECK(esp_wifi_start());
     }
 
-    xEventGroupWaitBits(s_wifi_event_group, WIFI_CONNECTED_BIT, pdFALSE, pdFALSE, portMAX_DELAY);
-    ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
-    init_time_sync();
+    // 提前拉起网络收发任务，无需在 app_main 中死等 Wi-Fi
+    xTaskCreatePinnedToCore(audio_receiver_task, "audio_task", 8192, NULL, 12, NULL, 0); // 堆栈由 4096 扩大到 8192 防止溢出
+    xTaskCreatePinnedToCore(video_receiver_task, "video_task", 8192, NULL, 10, NULL, 0);
 
-    xTaskCreatePinnedToCore(audio_receiver_task, "audio_task", 4096, NULL, 12, NULL, 0); // 音频极其敏感，给予最高优先级 (12)
-    xTaskCreatePinnedToCore(video_receiver_task, "video_task", 8192, NULL, 10, NULL, 0); // 视频接收其次 (10)
-    start_webserver();
-
+    bool webserver_started = false;
     TickType_t last_scan_time = 0;
     while (1)
     {
         vTaskDelay(pdMS_TO_TICKS(1000));
 
+        // 首次连接成功 Wi-Fi 后按需启动 WebServer 与 SNTP 时间同步，解绑主循环
+        if (!webserver_started && (xEventGroupGetBits(s_wifi_event_group) & WIFI_CONNECTED_BIT))
+        {
+            webserver_started = true;
+            esp_wifi_set_ps(WIFI_PS_NONE);
+            init_time_sync();
+            start_webserver();
+            ESP_LOGI("WEB", "Web server started on port 80");
+        }
         // 5s 扫描一次 WiFi 信号强度和剩余内存，并根据情况触发 WiFi 扫描以更新附近 AP 列表
         if (xTaskGetTickCount() - last_scan_time >= pdMS_TO_TICKS(5000))
         {

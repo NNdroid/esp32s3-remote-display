@@ -337,6 +337,19 @@
                     <input type="checkbox" id="mirror_y_chk" onchange="setSetting(`mirror_y=${this.checked?1:0}&save=1`)" /> ↕️ Vertical Mirror (Flip Y)
                 </label>
                 <label class="row-checkbox">
+                    <input type="checkbox" id="auto_sleep_chk" onchange="setSetting(`auto_sleep=${this.checked?1:0}&save=1`)" /> 🌙 Auto Sleep & Energy Saver (3 Min Idle)
+                </label>
+                <label class="row-checkbox">
+                    <input type="checkbox" id="hourly_chime_chk" onchange="setSetting(`chime=${this.checked?1:0}&save=1`)" /> 🔔 Enable Cyberpunk Hourly Chime
+                </label>
+                <label class="row-checkbox">
+                    <input type="checkbox" id="alarm_chk" onchange="setSetting(`alarm=${this.checked?1:0}&save=1`)" /> ⏰ Enable Cyberpunk Alarm
+                </label>
+                <div class="row">
+                    <label>⏰ Alarm Time:</label>
+                    <input type="time" id="alarm_time_val" onchange="setSetting(`alarm_time=${this.value}&save=1`)" style="width: auto;" />
+                </div>
+                <label class="row-checkbox">
                     <input type="checkbox" id="osd_chk" onchange="setSetting(`osd=${this.checked?1:0}`)" /> Show OSD (Stats & Battery)
                 </label>
                 <label class="row-checkbox">
@@ -359,6 +372,8 @@
                     </select>
                 </div>
             </div>
+
+
 
             <div class="control-panel">
                 <h3>🌐 Wi-Fi Configuration</h3>
@@ -1150,6 +1165,14 @@
                     document.getElementById("audio_chk").checked = d.audio === 1;
                     document.getElementById("mirror_x_chk").checked = d.mirror_x === 1;
                     document.getElementById("mirror_y_chk").checked = d.mirror_y === 1;
+                    if(d.auto_sleep !== undefined) document.getElementById("auto_sleep_chk").checked = d.auto_sleep === 1;
+                    if(d.chime !== undefined) document.getElementById("hourly_chime_chk").checked = d.chime === 1;
+                    if(d.alarm !== undefined) document.getElementById("alarm_chk").checked = d.alarm === 1;
+                    if(d.alarm_h !== undefined && d.alarm_m !== undefined) {
+                        let hh = d.alarm_h.toString().padStart(2, '0');
+                        let mm = d.alarm_m.toString().padStart(2, '0');
+                        document.getElementById("alarm_time_val").value = `${hh}:${mm}`;
+                    }
                     if(d.timezone) document.getElementById("tz_select").value = d.timezone;
                     document.getElementById("cfg_user").value = d.user;
                     document.getElementById("udp_port").value = d.udp_port;
