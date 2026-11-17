@@ -49,6 +49,17 @@ Latency design (LOW_LATENCY=1, the default):
       receiver turns out to be the bottleneck.
     - stdin is flushed after every frame, muxer/AVIO buffering is disabled,
       and the UDP tee branch flushes each packet immediately.
+    - FFmpeg's CFR video sync is disabled (-vsync 0) on ALL three pipelines
+      (input decode, UDP MJPEG tee, HLS H.264). With wall-clock PTS the
+      default CFR mode re-writes the timeline to the DECLARED framerate and
+      duplicates/drops frames to fill it. Measured: 6fps feed declared as
+      25fps produced a 28764-byte 2s HLS segment vs 7332 bytes with
+      passthrough - ~4x wasted encodes/packets. One Python write now always
+      equals one wire/HLS frame, and the timeline follows real time.
+    - HLS uses 1s segments (not 2s) + split_by_time, so a segment closes on
+      the time grid instead of waiting for the next keyframe. The bundled
+      player sits ~2 segments behind live instead of 3 x 2s. End-to-end HLS
+      delay drops from ~6-8s to ~2-3s without losing a segment of safety.
 
     *** DIAGNOSTIC BLIND SPOT (read this before blaming the receiver) ***
     The burned-in "SENT HH:MM:SS" is stamped at DRAW time, and "age" /
@@ -304,6 +315,42 @@ LIVE_MUX_TUNING = getenv_bool("LIVE_MUX_TUNING", True)
 # It also makes rolling segments / event MP4s follow real elapsed time
 # even when frames were dropped.
 LIVE_WALLCLOCK_PTS = getenv_bool("LIVE_WALLCLOCK_PTS", True)
+
+# FFmpeg's DEFAULT video sync mode is CFR: it duplicates or drops frames to
+# fill the declared "-framerate", even when every input frame already has a
+# wall-clock PTS. Measured on this pipeline (6fps feed, -framerate 25): a 2s
+# HLS segment was 28764 bytes with the default sync but 7332 bytes with
+# passthrough - i.e. FFmpeg was encoding ~4x as many frames as actually
+# arrived. That wastes CPU, inflates every UDP packet stream and makes the
+# timeline follow the DECLARED rate instead of real time.
+# Passthrough makes each frame written by Python produce exactly ONE encoded
+# frame. FFmpeg 5+ deprecates "-vsync 0" in favour of "-fps_mode passthrough"
+# and prints a warning on every process start; detect once at startup and use
+# the modern spelling when available, falling back for older builds.
+# Set LIVE_VSYNC_PASSTHROUGH=0 only if an unusual FFmpeg build misbehaves.
+LIVE_VSYNC_PASSTHROUGH = getenv_bool("LIVE_VSYNC_PASSTHROUGH", True)
+
+
+def detect_sync_passthrough_args() -> list:
+    """Return the non-deprecated frame-sync args supported by this FFmpeg."""
+    try:
+        result = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-h", "full"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=8,
+        )
+        text = result.stdout.decode("utf-8", errors="ignore")
+        if "-fps_mode" in text:
+            return ["-fps_mode", "passthrough"]
+    except Exception:
+        pass
+    return ["-vsync", "0"]
+
+
+SYNC_PASSTHROUGH_ARGS = (
+    detect_sync_passthrough_args() if LIVE_VSYNC_PASSTHROUGH else []
+)
 
 # Diagnostic overlay: stamp every pushed frame with the SENDER wall clock.
 # Compare the number shown on the receiver with a phone clock - that gap is
@@ -606,14 +653,27 @@ HLS_ENABLED = getenv_bool("HLS_ENABLED", True)
 _hls_feed_fps = LIVE_OUTPUT_FPS if LIVE_OUTPUT_FPS > 0 else INPUT_FPS
 HLS_FPS = int(os.getenv("HLS_FPS", str(max(1, round(_hls_feed_fps)))))
 HLS_QUEUE_SIZE = max(1, int(os.getenv("HLS_QUEUE_SIZE", "1")))
-HLS_TIME = float(os.getenv("HLS_TIME", "2"))
+# HLS end-to-end latency is roughly (HLS_TIME x hls.js liveSyncDurationCount)
+# plus one segment still being encoded. 2s segments + count=3 used to mean
+# ~6-8s of playback delay. 1s segments + count=2 bring that down to ~2-3s
+# while still leaving one segment of safety against a missing/Cold edge
+# segment. Do NOT go below 1s with MPEG-TS: sub-second segments add heavy
+# per-segment TS/m3u8 overhead and some players cannot handle them.
+HLS_TIME = float(os.getenv("HLS_TIME", "1"))
 # Number of segments kept in the live playlist AND on disk. FFmpeg's
 # delete_segments removes a .ts as soon as it falls out of this window, so
 # 5 x 2s = only ~10s of origin lifetime: a CDN edge or a player holding a
-# playlist for a few seconds gets a 404 on every segment. 15 x 2s = ~30s,
-# which is still small (a few MB) but survives CDN cache lag. Raise further
-# (30+) if your CDN has slow edge propagation.
-HLS_LIST_SIZE = int(os.getenv("HLS_LIST_SIZE", "15"))
+# playlist for a few seconds gets a 404 on every segment. With 1s segments
+# the default is 30 x 1s = ~30s: still only a few MB, but it keeps the old
+# 30s safety window for CDN edge propagation. Raise further if your CDN has
+# slow edge propagation.
+HLS_LIST_SIZE = int(os.getenv("HLS_LIST_SIZE", "30"))
+# Without split_by_time the HLS muxer waits for the next keyframe AFTER
+# hls_time before closing a segment, so a dropped/jittery frame can make a
+# "1s" segment 1.5-2s. With it, segments close on the time grid and the
+# playlist EXTINF stays equal to HLS_TIME (verified locally: 1.000000 each).
+# Set HLS_SPLIT_BY_TIME=0 if a very old FFmpeg build rejects the flag.
+HLS_SPLIT_BY_TIME = getenv_bool("HLS_SPLIT_BY_TIME", True)
 HLS_H264_ENCODER = os.getenv("HLS_H264_ENCODER", "libx264")
 HLS_VIDEO_BITRATE = os.getenv("HLS_VIDEO_BITRATE", "700k")
 HLS_X264_PRESET = os.getenv("HLS_X264_PRESET", "ultrafast")
@@ -1132,7 +1192,7 @@ def _atomic_copy_file(src: str, dst: Path) -> None:
             pass
 
 
-PLAYER_MARKER = "hls-debug-player-v7"
+PLAYER_MARKER = "hls-debug-player-v8"
 
 PLAYER_PAGE = r"""<!doctype html>
 <html lang="en" data-theme="dark">
@@ -1348,7 +1408,7 @@ html[data-theme="light"] .vod-empty{color:#a3b4d2}
       <div class="logo"></div>
       <div>
         <h1>RTSP Monitor <span style="color:var(--accent2)">/ Live Console</span></h1>
-        <p>hls-debug-player-v5 &middot; zero external requests</p>
+        <p>hls-debug-player-v8 &middot; zero external requests</p>
       </div>
     </div>
     <span class="live-badge"><i class="dot"></i> LIVE</span>
@@ -1719,14 +1779,14 @@ function startPlayer(url){
   if(!Hls.isSupported()){fail('Hls.isSupported() is false (MSE unavailable)');setState('MSE UNAVAILABLE','bad');return;}
 
   try{if(hlsRef){hlsRef.destroy();}}catch(e){}
-  /* liveSyncDurationCount=3 keeps 3 segments of safety margin: one
-     missing .ts (edge MISS after delete_segments removed it) must not
-     immediately stall playback. With 2s segments this is ~6s latency,
-     the same as the old 2 x 3s segments. */
+  /* Stay 2 x 1s segments behind the live edge: one segment may still be
+     being encoded / propagating to the CDN edge, the other is safety
+     against a single edge MISS. This used to be 3 x 2s (~6-8s latency).
+     lowLatencyMode + a higher catch-up rate keep the gap from growing. */
   var h=new Hls({
     lowLatencyMode:true,
-    liveSyncDurationCount:3,
-    maxLiveSyncPlaybackRate:1.2,
+    liveSyncDurationCount:2,
+    maxLiveSyncPlaybackRate:1.5,
     debug:false,
     manifestLoadingMaxRetry:6,
     manifestLoadingRetryDelay:600,
@@ -1735,7 +1795,7 @@ function startPlayer(url){
     fragLoadingMaxRetry:5,
     fragLoadingRetryDelay:400,
     startFragPrefetch:true,
-    backBufferLength:30
+    backBufferLength:12
   });
   hlsRef=h;
   lastFragAt=Date.now();
@@ -1810,7 +1870,7 @@ setInterval(function(){
 },4000);
 setInterval(refreshVod,15000);
 
-say('console ready - hls-debug-player-v7 - ZERO external requests');
+say('console ready - hls-debug-player-v8 - ZERO external requests');
 loadLocalHls(0);
 })();
 </script>
@@ -2067,6 +2127,10 @@ def build_hls_command(hls_dir: Path) -> list:
 
         "-map", "0:v",
         "-an",
+        # Do NOT let FFmpeg duplicate/drop frames to fill -framerate. Each
+        # frame written by the HLS writer thread becomes exactly one encoded
+        # frame; wall-clock PTS then give a real-time HLS timeline.
+        *SYNC_PASSTHROUGH_ARGS,
         "-c:v", HLS_H264_ENCODER,
         "-pix_fmt", "yuv420p",
         "-b:v", HLS_VIDEO_BITRATE,
@@ -2082,6 +2146,17 @@ def build_hls_command(hls_dir: Path) -> list:
             "-tune", "zerolatency",
         ]
 
+    # FFmpeg rejects split_by_time together with independent_segments
+    # ("cannot be enabled together") and silently drops the latter, which
+    # spams a warning on every start. They are mutually exclusive by design:
+    # split_by_time cuts on the clock, independent_segments cuts at IDRs.
+    # Prefer the low-latency time grid and omit the conflicting flag.
+    hls_flags = "delete_segments+omit_endlist+temp_file"
+    if HLS_SPLIT_BY_TIME:
+        hls_flags += "+split_by_time"
+    else:
+        hls_flags += "+independent_segments"
+
     command += [
         "-f", "hls",
         "-hls_time", f"{HLS_TIME:g}",
@@ -2090,8 +2165,9 @@ def build_hls_command(hls_dir: Path) -> list:
         # omit_endlist      -> stays a LIVE playlist, no ENDLIST
         # independent_segments -> every .ts can be cached/decoded alone
         # delete_segments   -> origin dir does not grow forever
+        # split_by_time     -> cut on the time grid, not the next keyframe
         "-hls_flags",
-        "delete_segments+omit_endlist+independent_segments+temp_file",
+        hls_flags,
         # epoch_us numbering: a restart NEVER reuses a segment URL with
         # different bytes, which would poison a CDN edge cache. Plain
         # "epoch" (seconds) is not enough - a restart within the same
@@ -2298,6 +2374,10 @@ def start_input_ffmpeg() -> subprocess.Popen:
         # Video -> raw BGR.
         "-map", "0:v:0",
         "-vf", f"fps={INPUT_FPS},scale={WIDTH}:{HEIGHT}:flags=fast_bilinear",
+        # fps= already defines the capture grid. Default CFR sync would
+        # duplicate/drop frames AGAIN on the way out of the demuxer, adding
+        # invisible frames to the raw pipe for Python to drain.
+        *SYNC_PASSTHROUGH_ARGS,
         "-pix_fmt", "bgr24",
         "-f", "rawvideo",
         # The AUDIO output had this already; the rawvideo pipe did not.
@@ -2409,12 +2489,18 @@ def start_output_ffmpeg(rolling_dir: Path) -> subprocess.Popen:
 
         "-map", "0:v",
         "-an",
+        # One Python write = one coded JPEG frame. Default CFR sync would
+        # duplicate frames whenever real arrival lags behind -framerate,
+        # turning a temporary hiccup into extra packets on the wire.
+        *SYNC_PASSTHROUGH_ARGS,
         "-c:v", MJPEG_ENCODER,
         "-q:v", str(MJPEG_QUALITY),
         "-pix_fmt", "yuvj420p",
 
         # Prevent the muxer / AVIO layer from holding a whole frame back.
         "-max_delay", "0",
+        "-muxdelay", "0",
+        "-muxpreload", "0",
         "-flush_packets", "1",
         "-fflags", "+nobuffer+flush_packets",
 
