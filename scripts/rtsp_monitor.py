@@ -299,6 +299,17 @@ LOW_LATENCY = getenv_bool("LOW_LATENCY", True)
 # Pending frames in low-latency mode. 1 = true "latest frame only".
 LIVE_QUEUE_SIZE = max(1, int(os.getenv("LIVE_QUEUE_SIZE", "1")))
 
+# Drop frames that are already stale when the main loop gets them.
+#
+# The single-slot queue already drops stale frames BEFORE processing, but a
+# frame that was freshly queued can still go stale while the main loop is
+# busy (event start used to block here for hundreds of ms). Pushing such a
+# frame shows old video and, worse, can re-trigger motion logic on a picture
+# that no longer matches reality. A frame older than this many milliseconds
+# is discarded: no overlay, no push, no HLS, no event state changes.
+# 0 disables the check. Default ~3 frame times at 25fps.
+MAX_FRAME_AGE_MS = float(os.getenv("MAX_FRAME_AGE_MS", "120"))
+
 # Low-latency muxer options on the UDP tee branch. Set to 0 if an older
 # FFmpeg build rejects one of these child options.
 LIVE_MUX_TUNING = getenv_bool("LIVE_MUX_TUNING", True)
@@ -1056,42 +1067,54 @@ class SnapshotNotifier:
         self.worker = worker
         self.publisher = publisher
         self.last_sent = 0.0
+        # One-slot queue: only the newest pending snapshot matters. The main
+        # loop must never wait on JPEG encoding or an fsync here.
+        self.jobs = queue.Queue(maxsize=1)
+        self.thread = threading.Thread(
+            target=self._run,
+            name="snapshot-worker",
+            daemon=True,
+        )
+        self.thread.start()
 
-    def on_event_start(
-        self,
-        frame,
-        event_id: int,
-        brightness: float,
-        box_count: int,
-    ) -> bool:
-        if not SNAPSHOT_NOTIFY:
-            return False
+    def _run(self):
+        while not STOP_EVENT.is_set() or not self.jobs.empty():
+            try:
+                job = self.jobs.get(timeout=0.5)
+            except queue.Empty:
+                continue
 
-        wall_now = datetime.now()
-        if in_quiet_hours(wall_now):
-            log("snapshot skipped: quiet hours")
-            return False
+            try:
+                self._encode_and_submit(job)
+            except Exception as exc:
+                log(
+                    f"snapshot worker error: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+            finally:
+                self.jobs.task_done()
 
-        mono_now = time.monotonic()
-        if mono_now - self.last_sent < SNAPSHOT_MIN_INTERVAL:
-            log("snapshot skipped: throttled")
-            return False
+    def _encode_and_submit(self, job) -> None:
+        frame_copy, wall_now, event_id, brightness, box_count = job
 
         ok, encoded = cv2.imencode(
             ".jpg",
-            frame,
+            frame_copy,
             [int(cv2.IMWRITE_JPEG_QUALITY), SNAPSHOT_JPEG_QUALITY],
         )
         if not ok:
             log("snapshot jpeg encode failed")
-            return False
+            return
 
         jpeg_bytes = encoded.tobytes()
 
-        # Reuse the SAME encoded JPEG as a static CDN URL. Local file
-        # write only - no second JPEG encode, no network in the main loop.
+        # Reuse the SAME encoded JPEG as a static CDN URL. Both the atomic
+        # write (fsync) and the temp file run on THIS thread, not the loop.
         if self.publisher is not None:
-            self.publisher.publish_snapshot(jpeg_bytes)
+            try:
+                self.publisher.publish_snapshot(jpeg_bytes)
+            except OSError as exc:
+                log(f"publish: latest.jpg failed: {exc}")
 
         fd, path = tempfile.mkstemp(
             prefix="rtsp_snap_",
@@ -1103,7 +1126,7 @@ class SnapshotNotifier:
         except OSError as exc:
             log(f"snapshot write failed: {exc}")
             _silent_remove(path)
-            return False
+            return
 
         caption = (
             f"MOTION {wall_now.strftime('%Y-%m-%d %H:%M:%S')} "
@@ -1112,10 +1135,54 @@ class SnapshotNotifier:
         )
         if not self.worker.submit_photo(path, caption):
             _silent_remove(path)
+            return
+
+        log(f"snapshot queued: event={event_id}")
+
+    def on_event_start(
+        self,
+        frame,
+        event_id: int,
+        brightness: float,
+        box_count: int,
+    ) -> bool:
+        """Non-blocking handoff. Safe to call on the hot live path."""
+        if not SNAPSHOT_NOTIFY:
             return False
 
+        wall_now = datetime.now()
+        if in_quiet_hours(wall_now):
+            return False
+
+        mono_now = time.monotonic()
+        if mono_now - self.last_sent < SNAPSHOT_MIN_INTERVAL:
+            return False
+
+        # The frame buffer is reused by the reader on the next iteration,
+        # so copy it before handing it to another thread.
+        try:
+            frame_copy = frame.copy()
+        except Exception:
+            return False
+
+        try:
+            self.jobs.put_nowait(
+                (frame_copy, wall_now, event_id, brightness, box_count)
+            )
+        except queue.Full:
+            try:
+                self.jobs.get_nowait()
+                self.jobs.task_done()
+            except queue.Empty:
+                pass
+            try:
+                self.jobs.put_nowait(
+                    (frame_copy, wall_now, event_id, brightness, box_count)
+                )
+            except queue.Full:
+                return False
+
         self.last_sent = mono_now
-        log(f"snapshot queued: event={event_id}")
         return True
 
 
@@ -3033,9 +3100,11 @@ class EventSegmentManager:
             )
             self.sessions[event_id] = session
 
-        # Try to copy the pre-event rolling window immediately.
-        self._copy_segments_for_session(session)
-
+        # Do NOT copy the rolling window here. This method is called from
+        # the hot main loop; copying 20 MJPEG segments (several MB each at
+        # q=1) would block live streaming for hundreds of ms. The background
+        # _run() thread copies every session on its 0.2s tick, so the
+        # pre-event window is captured within 200ms with zero loop cost.
         log(
             f"event session started: id={event_id}, "
             f"dir={event_dir}"
@@ -3511,12 +3580,60 @@ def main():
         publisher,
     )
 
-    # Input FFmpeg is deliberately restartable. The output FFmpeg stays alive
-    # so the UDP stream and rolling segments continue across RTSP reconnects.
+    # Both FFmpeg processes are restartable. Previously the output ffmpeg
+    # exiting or a broken stdin simply broke the main loop and killed the
+    # whole monitor. A UDP receiver going away / a slow disk should not take
+    # down the live pipeline, so restart it with backoff instead.
     decoder = start_input_ffmpeg()
     encoder = start_output_ffmpeg(rolling_dir)
     frame_clock = FrameClock()
     live_stats = LiveStats()
+    output_restart_delay = RTSP_RECONNECT_DELAY
+
+    def restart_output_ffmpeg(reason: str) -> bool:
+        """Replace a dead/stuck output ffmpeg. Returns False on stop."""
+        nonlocal encoder, output_restart_delay
+        log(f"output ffmpeg failed ({reason}); restarting in "
+            f"{output_restart_delay:.1f}s")
+        try:
+            if encoder.stdin:
+                try:
+                    encoder.stdin.close()
+                except Exception:
+                    pass
+            if encoder.poll() is None:
+                encoder.terminate()
+                try:
+                    encoder.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    encoder.kill()
+        except Exception:
+            pass
+
+        if STOP_EVENT.wait(output_restart_delay):
+            return False
+
+        try:
+            encoder = start_output_ffmpeg(rolling_dir)
+            threading.Thread(
+                target=stderr_reader,
+                args=(encoder, "OUTPUT"),
+                daemon=True,
+            ).start()
+            output_restart_delay = RTSP_RECONNECT_DELAY
+            log("output ffmpeg restarted")
+            return True
+        except Exception as exc:
+            log(
+                f"output ffmpeg restart failed: "
+                f"{type(exc).__name__}: {exc}"
+            )
+            output_restart_delay = min(
+                output_restart_delay * 1.5,
+                RTSP_RECONNECT_MAX_DELAY,
+            )
+            return False
+
 
     def start_decoder_reader(current_decoder):
         reader_stop_event = threading.Event()
@@ -3619,12 +3736,17 @@ def main():
     prev_loop_ms = 0.0
     last_stall_restart = 0.0
     total_frames = 0
+    stat_stale = 0
+    output_broken = False
 
     try:
         while not STOP_EVENT.is_set():
-            if encoder.poll() is not None:
-                log("output ffmpeg exited")
-                break
+            if encoder.poll() is not None or output_broken:
+                reason = "broken stdin" if output_broken else "process exited"
+                if not restart_output_ffmpeg(reason):
+                    break
+                output_broken = False
+                continue
 
             # RTSP input may legitimately disappear temporarily. Reconnect
             # only the input side; do not stop the monitor/output pipeline.
@@ -3700,6 +3822,21 @@ def main():
             frame_age_ms = (time.monotonic() - captured_at) * 1000.0
             stat_age_sum += frame_age_ms
             stat_age_max = max(stat_age_max, frame_age_ms)
+
+            # Drop stale frames BEFORE any work. A frame that waited too
+            # long is already old news: pushing it shows delayed video, and
+            # running motion detection on it produces bogus "violent motion"
+            # because the three-frame diff now spans hundreds of ms. That
+            # false positive starts an event (and a snapshot) on every stall.
+            # Clear the detection history too, so the next fresh frame does
+            # not diff against an ancient baseline.
+            if MAX_FRAME_AGE_MS > 0 and frame_age_ms > MAX_FRAME_AGE_MS:
+                stat_stale += 1
+                live_stats.add_drop()
+                prev_prev_gray = None
+                prev_gray = None
+                motion_confirm_count = 0
+                continue
 
             frame_view = np.frombuffer(
                 raw,
@@ -3897,11 +4034,11 @@ def main():
                     # nothing on this thread ever waits for HLS.
                     if hls_active:
                         hls_publisher.submit(payload)
-                except (BrokenPipeError, OSError) as exc:
-                    log(
-                        f"output ffmpeg pipe failed: {exc}"
-                    )
-                    break
+                except (BrokenPipeError, OSError, ValueError) as exc:
+                    # Do NOT exit the whole monitor. Mark the pipe broken;
+                    # the loop top restarts output ffmpeg with backoff.
+                    log(f"output ffmpeg pipe failed: {exc}")
+                    output_broken = True
 
             # ----------------------------------------------------
             # Event end decision. The manager will wait for the
@@ -4032,6 +4169,7 @@ def main():
                     f"pipe_wait={pipe_wait:.0f}ms "
                     f"drain={drain_pct:.0f}% "
                     f"dropped={dropped} "
+                    f"stale={stat_stale} "
                     f"hlsq={hls_publisher.take_dropped() if hls_active else 0} "
                     f"lag_avg={avg_age:.0f}ms "
                     f"lag_max={stat_age_max:.0f}ms "
@@ -4046,6 +4184,7 @@ def main():
                 stat_age_max = 0.0
                 stat_loop_sum = 0.0
                 stat_loop_max = 0.0
+                stat_stale = 0
                 stat_start = time.monotonic()
 
     except KeyboardInterrupt:
